@@ -1,0 +1,62 @@
+# Secrets
+*.key
+*.pem
+*.p12
+*.pfx
+*api_key*.txt
+.env
+.env.*
+bigseller-tools/openai.key
+process_data/openai_api_key.txt
+
+# Build output (.NET)
+**/bin/
+**/obj/
+*.user
+*.suo
+*.nupkg
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Logs and runtime diagnostics
+*.log
+*.err
+*.out
+*.tmp
+*.temp
+
+# Local runtime configuration and business data
+launcher-settings.json
+data/
+*.xlsx
+*.xls
+*.csv
+
+# Browser/runtime profile data
+**/profiles/
+**/runtime-sessions/
+**/persistent-data/
+**/bigseller-profiles/
+**/bigseller-account-profiles/
+**/GPUPersistentCache/
+**/Cache/
+**/Code Cache/
+**/Session Storage/
+**/Local Storage/
+**/IndexedDB/
+
+# Dependencies
+node_modules/
+
+# Local editor/assistant state
+.cursor/
+.claude/
+

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>OpenMultiBraveLauncher</AssemblyName>
+    <RootNamespace>OpenMultiBraveLauncher</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Bundle the extension folder into the output directory -->
+    <Content Include="extension\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

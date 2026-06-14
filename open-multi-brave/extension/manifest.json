@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Brave Instance Info",
+  "version": "1.0.0",
+  "description": "Hiển thị IP proxy hiện tại và nhãn tài khoản cho từng instance Brave.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://api.ipify.org/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Brave Instance Info"
+  }
+}

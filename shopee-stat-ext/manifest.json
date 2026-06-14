@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Shopee Stat",
+  "version": "1.0.1",
+  "description": "Shopee product research tool - works with ShopeeStatApp",
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://shopee.vn/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://shopee.vn/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Shopee Stat"
+  }
+}

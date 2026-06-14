@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shopee Data Runner</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --line: #374151;
+      --accent: #22c55e;
+    }
+
+    body {
+      margin: 0;
+      width: 340px;
+      background:
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.18), transparent 34%),
+        radial-gradient(circle at bottom right, rgba(34, 197, 94, 0.16), transparent 32%),
+        var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+
+    .wrap { padding: 14px; }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 18px;
+      line-height: 1.2;
+    }
+
+    .sub {
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .card {
+      background: rgba(17, 24, 39, 0.9);
+      border: 1px solid rgba(55, 65, 81, 0.95);
+      border-radius: 14px;
+      padding: 12px;
+    }
+
+    label {
+      display: block;
+      margin: 10px 0 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .readonly {
+      width: 100%;
+      box-sizing: border-box;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 11px;
+      font-size: 13px;
+      min-height: 38px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .progress-track {
+      height: 4px;
+      background: var(--line);
+      border-radius: 2px;
+      margin: 10px 0 0;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 2px;
+      width: 0%;
+      transition: width 0.35s ease;
+    }
+
+    .status {
+      margin-top: 10px;
+      padding: 10px 11px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(31, 41, 55, 0.7);
+      min-height: 44px;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-line;
+    }
+
+    .log-header {
+      margin-top: 10px;
+      font-size: 11px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .run-log {
+      margin-top: 4px;
+      max-height: 90px;
+      overflow-y: auto;
+    }
+
+    .log-entry {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 0;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .log-dot {
+      flex-shrink: 0;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+
+    .log-dot-ok   { background: #22c55e; }
+    .log-dot-warn { background: #f59e0b; }
+    .log-dot-err  { background: #ef4444; }
+
+    .hint {
+      margin-top: 10px;
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .badge {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      color: #d1fae5;
+      background: rgba(34, 197, 94, 0.14);
+      border: 1px solid rgba(34, 197, 94, 0.3);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Shopee Data Runner <span class="badge">View</span></h1>
+    <p class="sub">Chỉ hiển thị trạng thái. Điều khiển chạy / dừng / sheet / dòng trên <strong>Multi Brave Manager</strong>.</p>
+
+    <div class="card">
+      <label>Sheet</label>
+      <div id="sheetDisplay" class="readonly">—</div>
+
+      <div class="row">
+        <div>
+          <label>Từ dòng</label>
+          <div id="startRowDisplay" class="readonly">—</div>
+        </div>
+        <div>
+          <label>Đến dòng</label>
+          <div id="endRowDisplay" class="readonly">—</div>
+        </div>
+      </div>
+
+      <div class="progress-track">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+
+      <div id="status" class="status">Đang chờ launcher…</div>
+
+      <div id="logSection" style="display:none;">
+        <div class="log-header">
+          <span>Kết quả gần đây</span>
+          <span id="logSummary"></span>
+        </div>
+        <div class="run-log" id="runLog"></div>
+      </div>
+
+      <div class="hint">
+        Extension chỉ click scrape và hiện thông báo trên trang. Launcher quản lý dòng, log và start/stop.
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Brave Instance Info</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", sans-serif;
+      font-size: 13px;
+      width: 280px;
+      background: #f5f7fa;
+      color: #222;
+    }
+
+    .header {
+      background: #1a73e8;
+      color: #fff;
+      padding: 12px 14px 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .header .title { font-size: 14px; font-weight: 600; flex: 1; }
+    .header .badge {
+      font-size: 11px;
+      background: rgba(255,255,255,0.25);
+      border-radius: 10px;
+      padding: 2px 8px;
+    }
+
+    .body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+
+    .row { display: flex; flex-direction: column; gap: 3px; }
+    .label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.4px; }
+
+    .ip-value {
+      font-size: 20px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: #1a73e8;
+      letter-spacing: 0.5px;
+    }
+
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot.online  { background: #34a853; }
+    .dot.offline { background: #ea4335; }
+    .dot.checking {
+      background: #fbbc04;
+      animation: pulse 1s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    input.account-label {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: inherit;
+      background: #fff;
+      transition: border-color 0.15s;
+    }
+    input.account-label:focus {
+      outline: none;
+      border-color: #1a73e8;
+      box-shadow: 0 0 0 2px rgba(26,115,232,0.2);
+    }
+    input.account-label::placeholder { color: #aaa; }
+
+    .divider {
+      border: none;
+      border-top: 1px solid #e0e0e0;
+    }
+
+    .refresh-btn {
+      align-self: flex-end;
+      background: none;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      padding: 4px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      color: #444;
+      transition: background 0.15s;
+    }
+    .refresh-btn:hover { background: #e8eaed; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="title">Brave Instance Info</span>
+    <span class="badge" id="badge">—</span>
+  </div>
+
+  <div class="body">
+    <!-- Account label -->
+    <div class="row">
+      <span class="label">Tên tài khoản</span>
+      <input
+        class="account-label"
+        id="accountLabel"
+        type="text"
+        maxlength="60"
+        placeholder="Ví dụ: Shop Acc 1, BigSeller VN…"
+      />
+    </div>
+
+    <hr class="divider" />
+
+    <!-- Current IP -->
+    <div class="row">
+      <span class="label">IP hiện tại (qua proxy)</span>
+      <span class="ip-value" id="ip">…</span>
+      <div class="status-line">
+        <div class="dot checking" id="dot"></div>
+        <span id="statusText">Đang kiểm tra…</span>
+      </div>
+    </div>
+
+    <button class="refresh-btn" id="refreshBtn">↺ Làm mới IP</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
