@@ -91,6 +91,90 @@ internal static class PageCdpHelper
         })()
         """;
 
+    // Cuộn trang kiểu người đang đọc: phần lớn cuộn xuống, thỉnh thoảng cuộn lên, độ dài ngẫu nhiên.
+    private const string HumanBrowseJs = """
+        (() => {
+          try {
+            const max = Math.max(0, (document.documentElement.scrollHeight || 0) - window.innerHeight);
+            const down = Math.random() < 0.78;
+            let delta = (down ? 1 : -1) * (120 + Math.floor(Math.random() * 520));
+            let target = (window.scrollY || 0) + delta;
+            if (target < 0) target = Math.floor(Math.random() * 120);
+            if (max > 0 && target > max) target = max - Math.floor(Math.random() * 200);
+            window.scrollTo({ top: Math.max(0, target), left: 0, behavior: "smooth" });
+            return { ok: true };
+          } catch (e) { return { ok: false, error: String(e) }; }
+        })()
+        """;
+
+    /// <summary>
+    /// Giả lập người dùng xem trang (cuộn nhẹ) trên tab Shopee hiện tại — gọi xen kẽ trong lúc nghỉ
+    /// giữa các link để cửa sổ trông như đang được xem. Best-effort: lỗi thì bỏ qua, không ném.
+    /// </summary>
+    public static async Task SimulateHumanBrowsingAsync(
+        int cdpPort,
+        string pageUrlHint,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var wsUrl = await FindWorkPageWsUrlAsync(cdpPort, pageUrlHint, cancellationToken);
+            if (wsUrl is null)
+                return;
+
+            using var socket = new ClientWebSocket();
+            await socket.ConnectAsync(new Uri(wsUrl), cancellationToken);
+            await SendCdpAsync(socket, 1, "Runtime.evaluate", new
+            {
+                expression = HumanBrowseJs,
+                returnByValue = true,
+            }, cancellationToken);
+        }
+        catch
+        {
+            // best-effort — giả lập xem trang không được phép làm hỏng vòng chạy.
+        }
+    }
+
+    /// <summary>Chọn ws của tab "làm việc" khớp hint nhất (ưu tiên đúng URL, rồi shopee), bỏ chrome/extension.</summary>
+    private static async Task<string?> FindWorkPageWsUrlAsync(
+        int cdpPort, string pageUrlHint, CancellationToken cancellationToken)
+    {
+        using var response = await AppServices.DirectHttp.GetAsync(
+            $"http://127.0.0.1:{cdpPort}/json/list", cancellationToken);
+        if (!response.IsSuccessStatusCode)
+            return null;
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+        var hint = (pageUrlHint ?? "").Trim();
+        var pages = new List<(string url, string wsUrl)>();
+        foreach (var item in doc.RootElement.EnumerateArray())
+        {
+            var type = item.TryGetProperty("type", out var t) ? t.GetString() : "";
+            if (!string.Equals(type, "page", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var url = item.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
+            if (string.IsNullOrWhiteSpace(url) ||
+                url.StartsWith("chrome://", StringComparison.OrdinalIgnoreCase) ||
+                url.StartsWith("chrome-extension://", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!item.TryGetProperty("webSocketDebuggerUrl", out var ws))
+                continue;
+            var wsUrl = ws.GetString();
+            if (!string.IsNullOrWhiteSpace(wsUrl))
+                pages.Add((url, wsUrl!));
+        }
+
+        if (pages.Count == 0)
+            return null;
+
+        return pages
+            .OrderByDescending(p => !string.IsNullOrWhiteSpace(hint) &&
+                                    p.url.Contains(hint, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(p => p.url.Contains("shopee", StringComparison.OrdinalIgnoreCase))
+            .First().wsUrl;
+    }
+
     public static async Task<List<VideoCandidate>> CollectVideoCandidatesAsync(
         int cdpPort,
         string pageUrlHint,

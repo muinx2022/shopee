@@ -95,6 +95,33 @@ internal sealed class CdpClient(int cdpPort)
         return await GetPageWebSocketUrlAsync().ConfigureAwait(false);
     }
 
+    public async Task<bool> WaitForReadyAsync(
+        int attempts = 40,
+        int delayMs = 500,
+        CancellationToken cancellationToken = default)
+    {
+        for (var i = 0; i < attempts; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                using var response = await AppServices.DirectHttp
+                    .GetAsync($"http://127.0.0.1:{Port}/json/version", cancellationToken)
+                    .ConfigureAwait(false);
+                if (response.IsSuccessStatusCode)
+                    return true;
+            }
+            catch
+            {
+                // retry
+            }
+
+            await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
+        }
+
+        return false;
+    }
+
     public async Task ReloadPageTargetsAsync(Func<string, bool> urlMatches)
     {
         using var response = await AppServices.DirectHttp.GetAsync($"http://127.0.0.1:{Port}/json/list");
@@ -121,6 +148,40 @@ internal sealed class CdpClient(int cdpPort)
             using var page = new ClientWebSocket();
             await page.ConnectAsync(new Uri(ws), CancellationToken.None);
             await SendAsync(page, 91, "Page.reload", new { ignoreCache = true }).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Điều hướng (Page.navigate) các tab khớp <paramref name="urlMatches"/> tới <paramref name="targetUrl"/>.
+    /// Khác reload: ép tab rời khỏi trang hiện tại (vd trang marketing/login bị redirect khi chưa có cookie)
+    /// để nạp thẳng khu app đã đăng nhập sau khi cookie vừa được set.
+    /// </summary>
+    public async Task NavigatePageTargetsAsync(Func<string, bool> urlMatches, string targetUrl)
+    {
+        using var response = await AppServices.DirectHttp.GetAsync($"http://127.0.0.1:{Port}/json/list");
+        if (!response.IsSuccessStatusCode)
+            return;
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        foreach (var item in doc.RootElement.EnumerateArray())
+        {
+            var type = item.TryGetProperty("type", out var t) ? t.GetString() : null;
+            if (!string.Equals(type, "page", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var url = item.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
+            if (!urlMatches(url))
+                continue;
+
+            var ws = item.TryGetProperty("webSocketDebuggerUrl", out var wsProp)
+                ? wsProp.GetString()
+                : null;
+            if (string.IsNullOrWhiteSpace(ws))
+                continue;
+
+            using var page = new ClientWebSocket();
+            await page.ConnectAsync(new Uri(ws), CancellationToken.None);
+            await SendAsync(page, 93, "Page.navigate", new { url = targetUrl }).ConfigureAwait(false);
         }
     }
 

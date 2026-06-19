@@ -42,6 +42,14 @@ internal static class ExtensionRunnerAutomation
     /// </summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> _resolvedExtensionByPort = new();
 
+    /// <summary>
+    /// Số lần mở lại popup tươi liên tiếp mà SW vẫn không phản hồi trước khi leo thang sang
+    /// relaunch profile. Thực tế: khi tái dùng browser/phiên cũ, SW runner THƯỜNG
+    /// không xuất hiện trong CDP và mở lại popup vô ích — chỉ relaunch (browser mới → onInstalled
+    /// → SW khởi động) mới cứu được. Nên để 2 (~15–20s) thay vì 4 để bớt phí thời gian.
+    /// </summary>
+    private const int MaxPopupReopenBeforeRelaunch = 2;
+
     /// <summary>Xóa ID cache khi Brave khởi động lại / dừng instance.</summary>
     public static void ClearResolvedExtension(int cdpPort) =>
         _resolvedExtensionByPort.TryRemove(cdpPort, out _);
@@ -57,8 +65,11 @@ internal static class ExtensionRunnerAutomation
         var lastLog = DateTime.MinValue;
         var lastWake = DateTime.MinValue;
         var lastPopupReopen = DateTime.MinValue;
-        var expectedId = TryGetRunnerExtensionIdFromProfile(profileRoot)
-            ?? RunnerExtensionPaths.TryGetLoadedExtensionId()
+        // Đếm số lần probe timeout/không-phản-hồi liên tiếp để leo thang sang reload SW.
+        // Mở lại popup KHÔNG cứu được SW kẹt cold-start — chỉ chrome.runtime.reload() mới dựng lại được.
+        var noResponseStreak = 0;
+        var expectedId = RunnerExtensionPaths.TryGetLoadedExtensionId()
+            ?? TryGetRunnerExtensionIdFromProfile(profileRoot)
             ?? throw new InvalidOperationException(
                 "Không tìm thấy thư mục extension Shopee Data Runner — build lại launcher.");
 
@@ -70,6 +81,10 @@ internal static class ExtensionRunnerAutomation
         ClearResolvedExtension(cdpPort);
 
         await CloseRunnerExtensionPopupTabsAsync(cdpPort, profileRoot, cancellationToken);
+
+        log?.Invoke($"Đánh thức extension {expectedId[..8]}… (popup mới)");
+        await TryWakeServiceWorkerAsync(cdpPort, expectedId, cancellationToken, forceNewPopup: true);
+        await Task.Delay(1500, cancellationToken);
 
         while (DateTime.UtcNow < deadline)
         {
@@ -107,7 +122,11 @@ internal static class ExtensionRunnerAutomation
 
             foreach (var id in ids)
             {
-                var (probeOk, probeMsg) = await ProbeExtensionWithReasonAsync(cdpPort, id, cancellationToken);
+                if (DateTime.UtcNow >= deadline)
+                    break;
+
+                var (probeOk, probeMsg) = await ProbeExtensionWithReasonAsync(
+                    cdpPort, id, cancellationToken, deadline);
                 if (probeOk)
                 {
                     // Ghi nh? ID d� x�c th?c � m?i thao t�c sau d�ng C�NG ID n�y
@@ -119,18 +138,38 @@ internal static class ExtensionRunnerAutomation
                 if (probeMsg.Contains("hasScrapeStep=false", StringComparison.OrdinalIgnoreCase) &&
                     DateTime.UtcNow - lastWake >= TimeSpan.FromSeconds(4))
                 {
+                    noResponseStreak = 0;
                     log?.Invoke("  → Reload extension vì service worker chưa nạp runner hook…");
                     await TryReloadExtensionAsync(cdpPort, id, cancellationToken);
                     lastWake = DateTime.UtcNow;
                     await Task.Delay(1800, cancellationToken);
                 }
-                else if (IsPopupBridgeError(probeMsg) &&
-                         DateTime.UtcNow - lastPopupReopen >= TimeSpan.FromSeconds(15))
+                else if ((IsPopupBridgeError(probeMsg) ||
+                          probeMsg.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
+                          probeMsg.Contains("quá thời gian", StringComparison.OrdinalIgnoreCase) ||
+                          probeMsg.Contains("không phản hồi", StringComparison.OrdinalIgnoreCase)) &&
+                         DateTime.UtcNow - lastPopupReopen >= TimeSpan.FromSeconds(5))
                 {
-                    log?.Invoke("  → Mở lại popup extension vì service worker không nhận message…");
-                    await TryWakeServiceWorkerAsync(cdpPort, id, cancellationToken, forceNewPopup: true);
+                    noResponseStreak++;
                     lastPopupReopen = DateTime.UtcNow;
                     lastWake = DateTime.UtcNow;
+
+                    // KHÔNG dùng chrome.runtime.reload() cho ca này: reload làm Brave disable
+                    // extension unpacked → popup mới mất chrome.runtime (TypeError sendMessage) lặp vô hạn.
+                    // Mở lại popup tươi đủ cứu SW chỉ chậm cold-start; nếu SW câm thật thì leo thang
+                    // sang relaunch profile (caller bắt lỗi → BringUpProfileAsync nạp lại extension → SW mới).
+                    if (noResponseStreak >= MaxPopupReopenBeforeRelaunch)
+                    {
+                        var swSummary = await GetAllSwTargetsSummaryAsync(cdpPort, cancellationToken);
+                        log?.Invoke($"  → SW vẫn không phản hồi sau {noResponseStreak} lần mở popup [json/list: {swSummary}] — mở lại profile để nạp lại extension…");
+                        throw new InvalidOperationException(
+                            "Service worker extension Shopee Data Runner không phản hồi qua CDP sau nhiều lần thử — mở lại profile.");
+                    }
+
+                    log?.Invoke("  → Mở lại popup extension tươi (SW chưa phản hồi)…");
+                    // Dọn popup cũ/chết (kể cả popup bị orphan) trước khi mở popup mới để tránh bám tab chết.
+                    await CloseRunnerExtensionPopupTabsAsync(cdpPort, profileRoot, cancellationToken);
+                    await TryWakeServiceWorkerAsync(cdpPort, id, cancellationToken, forceNewPopup: true);
                     await Task.Delay(1800, cancellationToken);
                 }
             }
@@ -166,13 +205,49 @@ internal static class ExtensionRunnerAutomation
         CancellationToken ct,
         bool forceNewPopup = false)
     {
-        if (await GetSwTargetIdFromListAsync(cdpPort, extensionId, ct) is not null)
-            return;
-
+        // SW có trong /json/list không đủ: SW pinner có thể giữ flat session trước khi hook nạp xong.
+        // Chỉ skip khi popup extension đã mở — popup là cầu nối sendMessage tới SW đáng tin cậy nhất.
         var popupUrl = $"chrome-extension://{extensionId}/popup.html";
 
-        // Cách 1: Chrome/Brave remote endpoint /json/new tạo tab extension ổn định hơn
-        // Target.createTarget(background=true) có thể không materialize popup target trong Brave.
+        // Nếu popup đã mở thì dùng lại; /json/new luôn mở tab foreground nên chỉ dùng fallback cuối.
+        var existingPopupTarget = await FindExtensionPopupTargetIdAsync(cdpPort, extensionId, ct);
+        if (existingPopupTarget is not null)
+        {
+            if (!forceNewPopup)
+                return;
+
+            await TryCloseCdpTargetAsync(cdpPort, existingPopupTarget, ct);
+            await Task.Delay(350, ct);
+        }
+
+        ClientWebSocket? browser = null;
+        try
+        {
+            browser = await ConnectBrowserWebSocketAsync(cdpPort, ct);
+            await SendCdpAsync(browser, 50, "Target.createTarget", new
+            {
+                url = popupUrl,
+                background = true,
+            }, ct);
+            // Kh�ng d�ng tab � d? popup l�m c?u n?i g?i SW cho c�c l?nh launcher.
+        }
+        catch { }
+        finally
+        {
+            if (browser is not null)
+            {
+                try { if (browser.State == WebSocketState.Open) await browser.CloseAsync(WebSocketCloseStatus.NormalClosure, "", ct); } catch { }
+                browser.Dispose();
+            }
+        }
+
+        await Task.Delay(300, ct);
+        existingPopupTarget = await FindExtensionPopupTargetIdAsync(cdpPort, extensionId, ct);
+        if (existingPopupTarget is not null)
+            return;
+
+        // Fallback: Chrome/Brave remote endpoint /json/new tạo tab extension ổn định hơn,
+        // nhưng có thể giành focus nên chỉ dùng khi Target.createTarget không tạo được popup.
         try
         {
             using var response = await AppServices.DirectHttp.PutAsync(
@@ -185,38 +260,6 @@ internal static class ExtensionRunnerAutomation
         catch
         {
             // fallback below
-        }
-
-        // C�ch 1 (CH�NH): m? popup URL trong tab m?i qua Target.createTarget.
-        // N?u popup d� m? th� gi? nguy�n; Runtime.evaluate tr�n popup s? g?i
-        // chrome.runtime.sendMessage v� t? d�nh th?c SW khi c?n. ��ng/m? l?i
-        // liên tục làm launcher bị kẹt ở vòng "wake" và không vào bước chạy.
-        var existingPopupTarget = await FindExtensionPopupTargetIdAsync(cdpPort, extensionId, ct);
-        if (forceNewPopup && existingPopupTarget is not null)
-        {
-            await TryCloseCdpTargetAsync(cdpPort, existingPopupTarget, ct);
-            await Task.Delay(350, ct);
-            existingPopupTarget = null;
-        }
-        if (existingPopupTarget is not null)
-            return;
-
-        ClientWebSocket? browser = null;
-        try
-        {
-            browser = await ConnectBrowserWebSocketAsync(cdpPort, ct);
-            await SendCdpAsync(browser, 50, "Target.createTarget", new { url = popupUrl }, ct);
-            // Kh�ng d�ng tab � d? popup l�m c?u n?i g?i SW cho c�c l?nh launcher.
-            return;
-        }
-        catch { }
-        finally
-        {
-            if (browser is not null)
-            {
-                try { if (browser.State == WebSocketState.Open) await browser.CloseAsync(WebSocketCloseStatus.NormalClosure, "", ct); } catch { }
-                browser.Dispose();
-            }
         }
 
         // C�ch 2 (fallback): Target.activateTarget qua /json/list id (khi SW dang c� nhung chua active)
@@ -312,20 +355,23 @@ internal static class ExtensionRunnerAutomation
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var result = new List<string>();
-
-        foreach (var id in DiscoverExtensionIdsFromProfile(profileRoot))
-        {
-            if (seen.Add(id))
-                result.Add(id);
-        }
-
-        // Ch? d�ng ID t�nh t? path nhu fallback cu?i c�ng. M?t s? profile d� c� extension
-        // kh�c tr�ng t�n file/popup; Preferences l� ngu?n d�ng tin hon d? tr�nh m? nh?m.
         var loaded = RunnerExtensionPaths.TryGetLoadedExtensionId();
-        if (result.Count == 0 && !string.IsNullOrWhiteSpace(loaded) && seen.Add(loaded))
+        if (!string.IsNullOrWhiteSpace(loaded) && seen.Add(loaded))
             result.Add(loaded);
 
         foreach (var id in await DiscoverExtensionIdsFromBrowserAsync(cdpPort, ct).ConfigureAwait(false))
+        {
+            if (string.IsNullOrWhiteSpace(loaded) || string.Equals(id, loaded, StringComparison.OrdinalIgnoreCase))
+            {
+                if (seen.Add(id))
+                    result.Add(id);
+            }
+        }
+
+        if (result.Count > 0)
+            return result;
+
+        foreach (var id in DiscoverExtensionIdsFromProfile(profileRoot))
         {
             if (seen.Add(id))
                 result.Add(id);
@@ -525,7 +571,12 @@ internal static class ExtensionRunnerAutomation
         DirectoryInfo profileRoot,
         CancellationToken ct)
     {
-        var runnerIds = DiscoverExtensionIdsFromProfile(profileRoot);
+        var runnerIds = new HashSet<string>(
+            DiscoverExtensionIdsFromProfile(profileRoot),
+            StringComparer.OrdinalIgnoreCase);
+        var loadedId = RunnerExtensionPaths.TryGetLoadedExtensionId();
+        if (!string.IsNullOrWhiteSpace(loadedId))
+            runnerIds.Add(loadedId);
         if (runnerIds.Count == 0)
             return;
 
@@ -569,6 +620,97 @@ internal static class ExtensionRunnerAutomation
         catch
         {
             // ignore
+        }
+    }
+
+    /// <summary>Đóng tab phụ (extension popup, New Tab, SP cũ, login) và giữ ít nhất 1 tab.</summary>
+    public static async Task TrimAuxiliaryTabsAsync(
+        int cdpPort,
+        CancellationToken ct,
+        bool closeShopeeLoginTabs = true)
+    {
+        await CloseAllExtensionPopupTabsAsync(cdpPort, ct);
+
+        try
+        {
+            using var response = await AppServices.DirectHttp.GetAsync(
+                $"http://127.0.0.1:{cdpPort}/json/list", ct);
+            if (!response.IsSuccessStatusCode)
+                return;
+
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+            var pages = new List<(string Id, string Url)>();
+            foreach (var item in doc.RootElement.EnumerateArray())
+            {
+                var type = item.TryGetProperty("type", out var ty) ? ty.GetString() ?? "" : "";
+                if (!string.Equals(type, "page", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var url = item.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
+                var id = item.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(id))
+                    pages.Add((id, url));
+            }
+
+            if (pages.Count == 0)
+                return;
+
+            var toClose = pages
+                .Where(p => ShouldCloseAuxiliaryTab(p.Url, closeShopeeLoginTabs))
+                .Select(p => p.Id)
+                .ToList();
+
+            while (toClose.Count > 0 && pages.Count - toClose.Count < 1)
+                toClose.RemoveAt(toClose.Count - 1);
+
+            foreach (var id in toClose)
+                await TryCloseCdpTargetAsync(cdpPort, id, ct);
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    private static bool ShouldCloseAuxiliaryTab(string url, bool closeShopeeLoginTabs)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return false;
+
+        if (url.StartsWith("chrome-extension://", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (closeShopeeLoginTabs &&
+            url.StartsWith("https://shopee.vn/buyer/login", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (IsNewTabUrl(url))
+            return true;
+
+        return IsShopeeProductUrl(url);
+    }
+
+    private static bool IsNewTabUrl(string url) =>
+        url.Equals("about:blank", StringComparison.OrdinalIgnoreCase) ||
+        url.StartsWith("chrome://newtab", StringComparison.OrdinalIgnoreCase) ||
+        url.StartsWith("brave://newtab", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsShopeeProductUrl(string url)
+    {
+        if (!url.Contains("shopee", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        try
+        {
+            var uri = new Uri(url);
+            if (Regex.IsMatch(uri.AbsolutePath, @"-i\.\d+\.\d+", RegexOptions.IgnoreCase))
+                return true;
+            return uri.Query.Contains("itemid=", StringComparison.OrdinalIgnoreCase) ||
+                   uri.Query.Contains("shopid=", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return url.Contains("-i.", StringComparison.OrdinalIgnoreCase);
         }
     }
 
@@ -618,8 +760,8 @@ internal static class ExtensionRunnerAutomation
         {
             var msg = ex.Message;
             if (msg.Contains("No tab with id", StringComparison.OrdinalIgnoreCase))
-                return new ScrapeStepResult(false, false, false, false, "Tab đã đóng - sẽ mở tab mới ở bước sau.", null, link);
-            return new ScrapeStepResult(false, false, false, false, msg, null, link);
+                return new ScrapeStepResult(false, false, false, false, "Tab scrape tạm mất kết nối — giữ tab để thử lại.", tabId, link);
+            return new ScrapeStepResult(false, false, false, false, msg, tabId, link);
         }
     }
 
@@ -882,9 +1024,16 @@ internal static class ExtensionRunnerAutomation
 
     private static string BuildPopupInvokeExpression(string method, string payloadExpression) =>
         "(async () => {" +
-        "const response = await chrome.runtime.sendMessage({" +
+        // Popup bị orphan sau khi extension reload/disable → chrome.runtime mất. Báo rõ thay vì TypeError mơ hồ.
+        "if (!(globalThis.chrome && chrome.runtime && chrome.runtime.sendMessage)) " +
+        "throw new Error('POPUP_CONTEXT_DEAD: chrome.runtime không khả dụng (popup bị orphan)');" +
+        // Đua với timeout 6s: SW câm thì reject nhanh (báo rõ) thay vì treo tới khi CDP cancel ở 10s.
+        "const response = await Promise.race([" +
+        "chrome.runtime.sendMessage({" +
         $"type:'LAUNCHER_INVOKE',method:{JsonSerializer.Serialize(method)},payload:{payloadExpression}" +
-        "});" +
+        "})," +
+        "new Promise((_, rej) => setTimeout(() => rej(new Error('SW_NO_RESPONSE: service worker không phản hồi sendMessage')), 6000))" +
+        "]);" +
         "if (!response?.ok) throw new Error(response?.error || 'Extension không phản hồi');" +
         "return response.result;" +
         "})()";
@@ -1040,8 +1189,12 @@ internal static class ExtensionRunnerAutomation
     public static async Task PinSwWithFlatSessionAsync(
         int cdpPort, string extensionId, Action<string> log, CancellationToken ct)
     {
-        // T�m nhanh SW trong /json/list � th? t?i da 40 l?n x 300ms = 12 gi�y
-        for (var i = 0; i < 40 && !ct.IsCancellationRequested; i++)
+        // Giữ SW sống SUỐT phiên runner: nếu SW bị Brave recycle (idle ~30s) thì tự attach lại.
+        // Trước đây dùng for 40 lần rồi dừng → sau khi pin lần đầu, lúc nghỉ 2–4 phút giữa các link
+        // SW chết, không ai dựng lại → link kế bị SW_NO_RESPONSE / mất hook (treo ~14 phút). Nay loop
+        // tới khi runner dừng (ct hủy).
+        var firstAttach = true;
+        while (!ct.IsCancellationRequested)
         {
             try
             {
@@ -1049,7 +1202,8 @@ internal static class ExtensionRunnerAutomation
                 var swId = await GetSwTargetIdFromListAsync(cdpPort, extensionId, ct).ConfigureAwait(false);
                 if (swId is null) continue;
 
-                log($"SW pinner: attach flat session tới target {swId[..Math.Min(swId.Length, 16)]}…");
+                if (firstAttach)
+                    log($"SW pinner: attach flat session tới target {swId[..Math.Min(swId.Length, 16)]}…");
                 using var browser = await ConnectBrowserWebSocketAsync(cdpPort, ct).ConfigureAwait(false);
 
                 var attach = await SendCdpAsync(browser, 1, "Target.attachToTarget", new
@@ -1062,33 +1216,39 @@ internal static class ExtensionRunnerAutomation
                 var sess = sessEl.GetString();
                 if (string.IsNullOrWhiteSpace(sess)) continue;
 
-                log("SW pinner: flat session OK, đang giữ SW sống…");
+                // Bật Runtime trên session của SW để có thể evaluate giữ SW bận.
+                try { await SendCdpAsync(browser, 2, "Runtime.enable", null, ct, sess).ConfigureAwait(false); }
+                catch { }
 
-                // Giữ browser WS open → duy trì flat session → SW không bị Brave terminate.
-                // Kh�ng d�ng ReceiveAsync timeout ? d�y: cancel receive c� th? l�m ClientWebSocket
-                // chuy?n sang Aborted sau d�ng 30 gi�y.
+                if (firstAttach)
+                {
+                    log("SW pinner: flat session OK, đang giữ SW sống…");
+                    firstAttach = false;
+                }
+
+                // QUAN TRỌNG: chạy code THẬT bên trong SW mỗi 15s. Chỉ giữ WebSocket mở (Target.getTargets
+                // trên session browser) KHÔNG reset bộ đếm idle ~30s của MV3 service worker → SW vẫn chết.
+                // Evaluate trong context SW mới tính là "hoạt động" và reset idle timer, giữ SW sống thật.
                 var keepAliveId = 100;
                 while (!ct.IsCancellationRequested && browser.State == WebSocketState.Open)
                 {
-                    try
+                    await Task.Delay(15_000, ct).ConfigureAwait(false);
+                    if (browser.State != WebSocketState.Open)
+                        break;
+
+                    // Nếu evaluate ném (SW đã bị recycle / session chết) → thoát vòng trong để attach lại.
+                    await SendCdpAsync(browser, keepAliveId++, "Runtime.evaluate", new
                     {
-                        await Task.Delay(20_000, ct).ConfigureAwait(false);
-                        if (browser.State != WebSocketState.Open)
-                            break;
-
-                        await SendCdpAsync(browser, keepAliveId++, "Target.getTargets", new { }, ct)
-                            .ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) { break; }
-                    catch { break; }
+                        expression = "true",
+                        returnByValue = true,
+                    }, ct, sess).ConfigureAwait(false);
                 }
-
-                log($"SW pinner: flat session đóng (state={browser.State})");
-                break;
             }
             catch (OperationCanceledException) { break; }
-            catch { /* Brave chưa sẵn sàng, thử lại */ }
+            catch { /* SW bị recycle hoặc Brave bận — vòng while sẽ tìm & attach lại */ }
         }
+
+        log("SW pinner: dừng giữ SW (runner kết thúc).");
     }
 
     /// <summary>
@@ -1494,16 +1654,16 @@ internal static class ExtensionRunnerAutomation
     }
 
     private static async Task<(bool ok, string reason)> ProbeExtensionWithReasonAsync(
-        int cdpPort, string extensionId, CancellationToken ct)
+        int cdpPort, string extensionId, CancellationToken ct, DateTime? deadline = null)
     {
         try
         {
-            // N?u chua c� SW l?n popup ? m? popup d? d�nh th?c SW tru?c khi evaluate.
-            // (SW extension trong Brave thường không xuất hiện như target độc lập, và bị
-            //  terminate khi idle → cần popup để wake + làm cầu nối sendMessage tới SW.)
-            var swWsUrl = await GetSwDebuggerUrlFromListAsync(cdpPort, extensionId, ct);
+            ct.ThrowIfCancellationRequested();
+            if (deadline is { } dl && DateTime.UtcNow >= dl)
+                return (false, "hết thời gian chờ extension");
+
             var popupUrl = await FindExtensionPopupDebuggerUrlAsync(cdpPort, extensionId, ct);
-            if (swWsUrl is null && popupUrl is null)
+            if (popupUrl is null)
             {
                 await TryWakeServiceWorkerAsync(cdpPort, extensionId, ct);
                 await Task.Delay(800, ct);
@@ -1511,16 +1671,32 @@ internal static class ExtensionRunnerAutomation
                 if (popupUrl is null)
                 {
                     var swSummary = await GetAllSwTargetsSummaryAsync(cdpPort, ct);
-                    return (false, $"không có SW target và không có popup [json/list SWs: {swSummary}]");
+                    return (false, $"không có popup extension [json/list SWs: {swSummary}]");
                 }
             }
 
-            var val = await EvaluateExtensionMethodAsync(cdpPort, extensionId, "probe", null, ct, maxAttempts: 8);
+            using var probeTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            probeTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+            JsonElement? val;
+            try
+            {
+                val = await EvaluateExtensionMethodAsync(
+                    cdpPort, extensionId, "probe", null, probeTimeout.Token, maxAttempts: 2);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                return (false, "probe timeout — extension không phản hồi");
+            }
+
             if (val is null)
                 return (false, "evaluate trả về null");
 
             var ok = val.Value.TryGetProperty("hasScrapeStep", out var hook) && hook.GetBoolean();
             return (ok, ok ? "OK" : $"hasScrapeStep=false (val={val.Value})");
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -1753,6 +1929,9 @@ internal static class ExtensionRunnerAutomation
         return null;
     }
 
+    private static readonly TimeSpan CdpDefaultReceiveTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan CdpEvaluateReceiveTimeout = TimeSpan.FromSeconds(18);
+
     private static async Task<JsonElement> SendCdpAsync(
         ClientWebSocket socket,
         int id,
@@ -1761,6 +1940,10 @@ internal static class ExtensionRunnerAutomation
         CancellationToken ct,
         string? sessionId = null)
     {
+        var receiveTimeout = string.Equals(method, "Runtime.evaluate", StringComparison.Ordinal)
+            ? CdpEvaluateReceiveTimeout
+            : CdpDefaultReceiveTimeout;
+
         string json;
         if (parameters is null)
         {
@@ -1778,18 +1961,37 @@ internal static class ExtensionRunnerAutomation
         var bytes = Encoding.UTF8.GetBytes(json);
         await socket.SendAsync(bytes, WebSocketMessageType.Text, true, ct);
 
+        using var receiveCts = receiveTimeout is { } timeout
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : null;
+        if (receiveTimeout is { } evalTimeout)
+        {
+            receiveCts?.CancelAfter(evalTimeout);
+        }
+        var receiveCt = receiveCts?.Token ?? ct;
+
         var buffer = new byte[1024 * 512];
         while (true)
         {
             using var ms = new MemoryStream();
             WebSocketReceiveResult recv;
-            do
+            try
             {
-                recv = await socket.ReceiveAsync(buffer, ct);
-                if (recv.MessageType == WebSocketMessageType.Close)
-                    throw new InvalidOperationException("CDP đóng khi gọi extension.");
-                ms.Write(buffer, 0, recv.Count);
-            } while (!recv.EndOfMessage);
+                do
+                {
+                    recv = await socket.ReceiveAsync(buffer, receiveCt);
+                    if (recv.MessageType == WebSocketMessageType.Close)
+                        throw new InvalidOperationException("CDP đóng khi gọi extension.");
+                    ms.Write(buffer, 0, recv.Count);
+                } while (!recv.EndOfMessage);
+            }
+            catch (OperationCanceledException) when (receiveCts is not null && receiveCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                throw new TimeoutException($"CDP {method} quá thời gian chờ ({receiveTimeout.TotalSeconds:0}s).");
+            }
+
+            if (receiveCts?.IsCancellationRequested == true && !ct.IsCancellationRequested)
+                throw new TimeoutException($"CDP {method} quá thời gian chờ ({receiveTimeout.TotalSeconds:0}s).");
 
             using var response = JsonDocument.Parse(ms.ToArray());
             var root = response.RootElement;

@@ -50,11 +50,11 @@ internal sealed class InstanceDetailPanel : UserControl
     {
         Dock = DockStyle.Fill;
         Padding = new Padding(12);
-        AutoScroll = true;
+        AutoScroll = false;
 
         var table = new TableLayoutPanel
         {
-            Dock = DockStyle.Top,
+            Dock = DockStyle.Fill,
             AutoSize = true,
             ColumnCount = 4,
         };
@@ -131,16 +131,16 @@ _openWithShopeeAccountCheck = new CheckBox
             Dock = DockStyle.Top,
             AutoSize = true,
             ColumnCount = 7,
-            RowCount = 5,
+            RowCount = 6,
         };
-        runnerTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
         runnerTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
-        runnerTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
+        runnerTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
+        runnerTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
         runnerTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
         runnerTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 94));
         runnerTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
         runnerTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (var i = 0; i < 5; i++)
+        for (var i = 0; i < 6; i++)
             runnerTable.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         _sheetCombo = new ComboBox
@@ -177,15 +177,9 @@ _openWithShopeeAccountCheck = new CheckBox
         AddCompactRunnerField(runnerTable, 0, "T\u1eeb d\u00f2ng", _startRowInput, 0);
         AddCompactRunnerField(runnerTable, 0, "\u0110\u1ebfn d\u00f2ng", _endRowInput, 2);
         AddCompactRunnerField(runnerTable, 0, "D\u00f2ng ti\u1ebfp", _nextRowInput, 4);
-        var nextRowHintCell = new FlowLayoutPanel
-        {
-            AutoSize = true,
-            WrapContents = false,
-            Margin = new Padding(0, 0, 0, 0),
-        };
-        nextRowHintCell.Controls.Add(_nextRowSuggestLabel);
-        runnerTable.Controls.Add(nextRowHintCell, 6, 0);
-        runnerTable.Controls.Add(_autoCloseOnFinishCheck, 0, 1);
+        runnerTable.Controls.Add(_nextRowSuggestLabel, 0, 1);
+        runnerTable.SetColumnSpan(_nextRowSuggestLabel, 7);
+        runnerTable.Controls.Add(_autoCloseOnFinishCheck, 0, 2);
         runnerTable.SetColumnSpan(_autoCloseOnFinishCheck, 7);
 
         _resumeHintLabel = new Label
@@ -196,7 +190,7 @@ _openWithShopeeAccountCheck = new CheckBox
             MaximumSize = new Size(640, 0),
             Text = "Ch\u1ea1y t\u1eeb d\u00f2ng \"T\u1eeb d\u00f2ng\" tr\u00ean form. B\u1ea5m M\u1edf profile tr\u01b0\u1edbc.",
         };
-        runnerTable.Controls.Add(_resumeHintLabel, 0, 2);
+        runnerTable.Controls.Add(_resumeHintLabel, 0, 3);
         runnerTable.SetColumnSpan(_resumeHintLabel, 7);
 
         _interruptLabel = new Label
@@ -208,7 +202,7 @@ _openWithShopeeAccountCheck = new CheckBox
             Visible = false,
             Text = "",
         };
-        runnerTable.Controls.Add(_interruptLabel, 0, 3);
+        runnerTable.Controls.Add(_interruptLabel, 0, 4);
         runnerTable.SetColumnSpan(_interruptLabel, 7);
 
         _runButton = new Button
@@ -269,7 +263,7 @@ _openWithShopeeAccountCheck = new CheckBox
         syncRow.Controls.Add(_resumeRunButton);
         syncRow.Controls.Add(_pushExtButton);
         syncRow.Controls.Add(_syncedAtLabel);
-        runnerTable.Controls.Add(syncRow, 0, 4);
+        runnerTable.Controls.Add(syncRow, 0, 5);
         runnerTable.SetColumnSpan(syncRow, 7);
 
         _runnerGroup.Controls.Add(runnerTable);
@@ -909,33 +903,9 @@ _openWithShopeeAccountCheck = new CheckBox
         ResumeContinueRequested?.Invoke();
     }
 
-    /// <summary>
-    /// Chưa có proxy (không Kiot key / proxy thủ công) và RequireProxy bật → cảnh báo, cho bấm OK để vẫn
-    /// mở (login Shopee bằng IP máy) thay vì chặn cứng. OK một lần thì runner tự mở lại cũng không hỏi nữa.
-    /// </summary>
-    private bool EnsureProxyOrConfirm()
-    {
-        if (_config is null || _session is null)
-            return true;
-        if (!_config.RequireProxy ||
-            _session.NoProxyAllowed ||
-            !string.IsNullOrWhiteSpace(_config.KiotProxyKey) ||
-            !string.IsNullOrWhiteSpace(_config.ManualProxy))
-            return true;
-
-        var answer = MessageBox.Show(
-            FindForm(),
-            "Instance chưa có proxy (KiotProxy key / proxy thủ công).\n\n"
-            + "Vẫn mở profile? Shopee sẽ đăng nhập bằng IP máy — tài khoản có thể bị nghi ngờ.",
-            _config.DisplayName,
-            MessageBoxButtons.OKCancel,
-            MessageBoxIcon.Warning);
-        if (answer != DialogResult.OK)
-            return false;
-
-        _session.AllowNoProxyForSession();
-        return true;
-    }
+    private bool EnsureProxyOrConfirm() =>
+        _config is null || _session is null ||
+        ProxyLaunchGuard.ConfirmOrAllow(_config, _session, FindForm());
 
     private void UpdateSyncedLabel()
     {
@@ -1045,9 +1015,7 @@ _openWithShopeeAccountCheck = new CheckBox
     private void OpenProfileFolder()
     {
         if (_config is null) return;
-        _config.EnsureProfileRelativePath();
-        var path = Path.Combine(AppSession.RootDirectory,
-            _config.ProfileRelativePath.Replace('/', Path.DirectorySeparatorChar));
+        var path = BraveProfileManager.GetProfileRootDirectory(_config).FullName;
         Directory.CreateDirectory(path);
         Process.Start(new ProcessStartInfo
         {
@@ -1121,8 +1089,10 @@ _openWithShopeeAccountCheck = new CheckBox
         table.Controls.Add(new Label
         {
             Text = label,
-            AutoSize = true,
-            Padding = new Padding(0, 8, 4, 0),
+            AutoSize = false,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(0, 4, 4, 0),
             Margin = new Padding(0, 0, 0, 2),
         }, column, row);
         control.Dock = DockStyle.Fill;

@@ -1,7 +1,9 @@
 """Workbook, XLSX lookup, and row-marking helpers for product updates."""
+import json
 import os
 import re
 import shutil
+import hashlib
 import threading
 import time
 import zipfile
@@ -369,6 +371,93 @@ def _resolve_data_row_range(sheet, start_row=2, end_row=None):
     return first_data_row, max(first_data_row, last_data_row)
 
 
+def _batch_cache_dir(workbook_path):
+    root = Path(os.environ.get("BIGSELLER_PROFILE_DIR") or Path(workbook_path).parent)
+    cache_dir = root.parent / ".update-product-workbook-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _batch_cache_key(workbook_path, sheet_name, start_row, end_row):
+    batch_id = os.environ.get("BIGSELLER_UPDATE_BATCH_ID", "").strip()
+    scope = "|".join([
+        batch_id,
+        str(Path(workbook_path).resolve()),
+        normalize_text(sheet_name),
+        str(int(start_row or 2)),
+        str(int(end_row or 0)),
+    ])
+    return hashlib.sha1(scope.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+
+@contextmanager
+def _json_file_lock(lock_path, timeout_sec=120):
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout_sec
+    handle = None
+    while handle is None:
+        try:
+            handle = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError as exc:
+            try:
+                if time.time() - lock_path.stat().st_mtime > timeout_sec:
+                    lock_path.unlink()
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                raise TimeoutError(f"Khong lay duoc workbook cache lock: {lock_path}") from exc
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        try:
+            os.close(handle)
+        except Exception:
+            pass
+        try:
+            lock_path.unlink()
+        except Exception:
+            pass
+
+
+def _batch_cache_path(workbook_path, sheet_name, start_row, end_row):
+    key = _batch_cache_key(workbook_path, sheet_name, start_row, end_row)
+    return _batch_cache_dir(workbook_path) / f"{key}.json"
+
+
+def _load_batch_workbook_cache(workbook_path, sheet_name, start_row, end_row):
+    workbook_path = Path(workbook_path)
+    cache_path = _batch_cache_path(workbook_path, sheet_name, start_row, end_row)
+    lock_path = cache_path.with_suffix(".lock")
+
+    with _json_file_lock(lock_path):
+        if cache_path.exists():
+            try:
+                with cache_path.open("r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                if isinstance(payload, dict) and isinstance(payload.get("index"), dict):
+                    return payload
+            except Exception:
+                pass
+
+        built = _build_workbook_index(workbook_path, sheet_name, start_row, end_row)
+        payload = {
+            "built_at": time.time(),
+            "workbook_path": str(workbook_path),
+            "sheet_name": sheet_name,
+            "start_row": int(start_row or 2),
+            "end_row": int(end_row or 0),
+            "index": built.get("index") or {},
+            "missing_product_name_index": built.get("missing_product_name_index") or {},
+        }
+        temp_path = cache_path.with_suffix(f".{os.getpid()}.tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(temp_path, cache_path)
+        return payload
+
+
 def search_in_workbook(target_id, workbook_path, sheet_name, start_row=2, end_row=None):
     workbook_path = Path(workbook_path)
     if not workbook_path.exists():
@@ -379,9 +468,13 @@ def search_in_workbook(target_id, workbook_path, sheet_name, start_row=2, end_ro
     # Mặc định bật; có thể tắt bằng env SHOPEE_DISABLE_WORKBOOK_CACHE=1
     target_id = str(target_id or "").strip()
     if os.environ.get("SHOPEE_DISABLE_WORKBOOK_CACHE", "0") != "1":
-        cached = _search_in_workbook_cached(str(target_id).strip(), workbook_path, sheet_name, start_row, end_row)
-        if cached is not None:
-            return cached
+        try:
+            cached = _load_batch_workbook_cache(workbook_path, sheet_name, start_row, end_row)
+            index = cached.get("index") or {}
+            missing_product_name_index = cached.get("missing_product_name_index") or {}
+            return index.get(target_id) or missing_product_name_index.get(target_id)
+        except Exception as cache_error:
+            log(f"Khong tai duoc workbook cache, fallback doc XLSX: {cache_error}")
 
     with workbook_file_lock(workbook_path):
         workbook = load_workbook_checked(workbook_path)
@@ -442,28 +535,6 @@ def search_in_workbook(target_id, workbook_path, sheet_name, start_row=2, end_ro
             }
 
     return None
-
-
-def _search_in_workbook_cached(target_id: str, workbook_path: Path, sheet_name: str, start_row: int, end_row=None):
-    target_id = str(target_id or "").strip()
-    if not target_id:
-        return None
-
-    cache_key = (str(workbook_path), normalize_text(sheet_name), int(start_row or 2), int(end_row or 0))
-    workbook_mtime = _workbook_mtime(workbook_path)
-    with _WORKBOOK_INDEX_LOCK:
-        cached = _WORKBOOK_INDEX_CACHE.get(cache_key)
-
-    if cached is None or cached.get("workbook_mtime") != workbook_mtime:
-        built = _build_workbook_index(workbook_path, sheet_name, start_row, end_row)
-        built["workbook_mtime"] = workbook_mtime
-        with _WORKBOOK_INDEX_LOCK:
-            _WORKBOOK_INDEX_CACHE[cache_key] = built
-        cached = built
-
-    index = cached.get("index") or {}
-    missing_product_name_index = cached.get("missing_product_name_index") or {}
-    return index.get(target_id) or missing_product_name_index.get(target_id)
 
 
 def _build_workbook_index(workbook_path: Path, sheet_name: str, start_row: int, end_row=None):

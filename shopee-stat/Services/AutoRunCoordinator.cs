@@ -19,8 +19,6 @@ public sealed class AutoRunCoordinator
 
     // Search params (read once from the UI when the run starts).
     private readonly string _region;
-    private readonly long _minPrice;
-    private readonly int _minSold;
 
     // Live sessions, for prompt browser teardown on Stop / form close.
     private readonly object _sesLock = new();
@@ -30,6 +28,9 @@ public sealed class AutoRunCoordinator
     private readonly object _accLock = new();
     private readonly HashSet<string> _busy = [];
     private readonly Dictionary<string, long> _restUntilTick = [];
+    // Tài khoản dính verify/captcha trong lượt này → loại khỏi pool (không lane nào dùng lại) + báo UI
+    // chuyển sang tab "Lỗi". Vĩnh viễn cho tới khi user "Khôi phục".
+    private readonly HashSet<string> _errored = new(StringComparer.OrdinalIgnoreCase);
     private const long RestMillis = 60_000;
 
     // Per-lane cancellation: the "✕" on a lane tab cancels just that lane's CURRENT keyword
@@ -47,6 +48,8 @@ public sealed class AutoRunCoordinator
     public event Action<int, string>? LaneKeywordReleased;          // laneId, keyword (rời lane: xong/skip/bỏ)
     public event Action? TasksChanged;
     public event Action? AccountsChanged;
+    public event Action<string>? AccountUsed;                       // accountId — lưu con trỏ "dùng sau cùng"
+    public event Action<string, string>? AccountErrored;            // accountId, reason — chuyển sang tab Lỗi
 
     /// <summary>Persist a finished keyword's products. Invoked off the UI thread.</summary>
     public Func<string, IReadOnlyList<ProductResult>, Task>? SaveExcel;
@@ -57,9 +60,7 @@ public sealed class AutoRunCoordinator
         IReadOnlyList<InstanceConfig> accounts,
         IEnumerable<string> keywords,
         int laneCount,
-        string region,
-        long minPrice,
-        int minSold)
+        string region)
     {
         _appSettings = appSettings;
         _taskStore = taskStore;
@@ -67,8 +68,6 @@ public sealed class AutoRunCoordinator
         _keywordQueue = new ConcurrentQueue<string>(keywords);
         _laneCount = Math.Max(1, laneCount);
         _region = region;
-        _minPrice = minPrice;
-        _minSold = minSold;
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -82,7 +81,7 @@ public sealed class AutoRunCoordinator
         await Task.WhenAll(workers);
     }
 
-    /// <summary>Best-effort synchronous kill of every lane's Brave window (Stop / form close).</summary>
+    /// <summary>Best-effort synchronous kill of every lane's Edge window (Stop / form close).</summary>
     public void KillAllBrowsers()
     {
         lock (_sesLock)
@@ -105,6 +104,17 @@ public sealed class AutoRunCoordinator
         {
             var s = _sessions.FirstOrDefault(x => x.LaneId == laneId);
             try { s?.KillBrowser(); } catch { }
+        }
+    }
+
+    /// <summary>"⟳" trên tab lane: kết nối lại lane NÀY — relaunch + tiếp tục từ checkpoint với cùng
+    /// account. Không bỏ từ khóa, không dừng cả lượt.</summary>
+    public void RestartLane(int laneId)
+    {
+        lock (_sesLock)
+        {
+            var s = _sessions.FirstOrDefault(x => x.LaneId == laneId);
+            try { s?.RequestReconnect(); } catch { }
         }
     }
 
@@ -164,6 +174,9 @@ public sealed class AutoRunCoordinator
         var resumeCategoryIndex = 1;
         var resumePage = 1;
         var reloadedGrid = false;
+        // Số lần tự kết nối lại liên tiếp KHÔNG có tiến triển trên cùng account — quá ngưỡng thì đổi account.
+        var reconnectStreak = 0;
+        const int MaxAutoReconnects = 3;
         if (taskId > 0 && _taskStore.GetTask(taskId) is { } rec)
         {
             resumeCategoryIndex = Math.Max(1, rec.ResumeCategoryIndex);
@@ -198,12 +211,15 @@ public sealed class AutoRunCoordinator
                     ? $"Tài khoản \"{account.DisplayName}\", từ khóa \"{keyword}\" — tiếp tục danh mục {resumeCategoryIndex}, trang {resumePage}."
                     : $"Tài khoản \"{account.DisplayName}\", từ khóa \"{keyword}\".");
 
+                var beforeCat = resumeCategoryIndex;
+                var beforePage = resumePage;
                 var config = BuildConfig(keyword, resumeCategoryIndex, resumePage);
                 var outcome = await session.RunAsync(account, config, ct, taskId);
                 taskId = session.TaskId; // capture the id created on the first fresh attempt
                 // Remember how far this attempt got so the next account resumes there, not at the start.
                 resumeCategoryIndex = Math.Max(1, session.LastCategoryIndex);
                 resumePage = Math.Max(1, session.LastPage);
+                var progressed = resumeCategoryIndex > beforeCat || (resumeCategoryIndex == beforeCat && resumePage > beforePage);
                 await session.CloseBrowserAsync();
 
                 if (outcome == SearchRunOutcome.Cancelled)
@@ -222,9 +238,38 @@ public sealed class AutoRunCoordinator
                     return;
                 }
 
-                // Failed (captcha/network/error): retry with another account, resuming at the checkpoint.
-                rest = outcome is SearchRunOutcome.CaptchaOrVerify or SearchRunOutcome.NetworkError;
-                LaneStatus?.Invoke(laneId, $"Lỗi ({outcome}) ở \"{keyword}\" — đổi account, tiếp tục từ danh mục {resumeCategoryIndex}, trang {resumePage}.");
+                if (outcome == SearchRunOutcome.Reconnect)
+                {
+                    // Mất kết nối / treo / user bấm "Kết nối lại" → tự relaunch + tiếp tục từ checkpoint,
+                    // ƯU TIÊN cùng account (không phải lỗi account). Nếu lặp lại nhiều lần mà không tiến
+                    // triển thì mới đổi account để tránh kẹt mãi trên 1 proxy chết.
+                    reconnectStreak = progressed ? 0 : reconnectStreak + 1;
+                    if (reconnectStreak <= MaxAutoReconnects)
+                    {
+                        tried.Remove(account.Id); // cho phép mượn lại chính account này
+                        LaneStatus?.Invoke(laneId, $"Kết nối lại \"{keyword}\" — {account.DisplayName}, tiếp tục danh mục {resumeCategoryIndex}, trang {resumePage} (lần {reconnectStreak}).");
+                    }
+                    else
+                    {
+                        reconnectStreak = 0;
+                        LaneStatus?.Invoke(laneId, $"Kết nối lại nhiều lần không được — đổi account, tiếp tục danh mục {resumeCategoryIndex}, trang {resumePage}.");
+                    }
+                }
+                else if (outcome == SearchRunOutcome.CaptchaOrVerify)
+                {
+                    // Verify traffic / captcha → đóng profile lỗi, chuyển account sang tab "Lỗi" (không
+                    // dùng lại trong lượt này), rồi đổi sang account khác tiếp tục từ checkpoint.
+                    reconnectStreak = 0;
+                    MarkErrored(account, "Verify/captcha");
+                    LaneStatus?.Invoke(laneId, $"\"{account.DisplayName}\" bị verify/captcha — chuyển sang tab Lỗi, đổi account, tiếp tục từ danh mục {resumeCategoryIndex}, trang {resumePage}.");
+                }
+                else
+                {
+                    // Failed (network/error): retry with another account, resuming at the checkpoint.
+                    reconnectStreak = 0;
+                    rest = outcome is SearchRunOutcome.NetworkError;
+                    LaneStatus?.Invoke(laneId, $"Lỗi ({outcome}) ở \"{keyword}\" — đổi account, tiếp tục từ danh mục {resumeCategoryIndex}, trang {resumePage}.");
+                }
             }
             catch (OperationCanceledException)
             {
@@ -258,8 +303,8 @@ public sealed class AutoRunCoordinator
     {
         Keyword = keyword,
         RegionFilterText = _region,
-        MinPriceVnd = _minPrice,
-        MinMonthlySold = _minSold,
+        MinPriceVnd = 0,
+        MinMonthlySold = 0,
         CheckVariantStock = false,
         ResumePage = resumePage,
         ResumeCategoryIndex = resumeCategoryIndex,
@@ -274,23 +319,27 @@ public sealed class AutoRunCoordinator
     {
         while (!ct.IsCancellationRequested)
         {
+            InstanceConfig? pick = null;
             lock (_accLock)
             {
-                var candidates = _accounts.Where(a => !tried.Contains(a.Id)).ToList();
+                var candidates = _accounts.Where(a => !tried.Contains(a.Id) && !_errored.Contains(a.Id)).ToList();
                 if (candidates.Count == 0)
                     return null; // exhausted for this keyword
 
                 var now = Environment.TickCount64;
-                var pick =
+                pick =
                     candidates.FirstOrDefault(a => !_busy.Contains(a.Id) && !IsResting(a.Id, now))
                     ?? candidates.FirstOrDefault(a => !_busy.Contains(a.Id));
 
                 if (pick is not null)
-                {
                     _busy.Add(pick.Id);
-                    return pick;
-                }
                 // else: all untried candidates are busy on other lanes → wait below.
+            }
+            if (pick is not null)
+            {
+                // Con trỏ "dùng sau cùng" → lượt chạy kế tiếp bắt đầu từ account ngay sau account này.
+                AccountUsed?.Invoke(pick.Id);
+                return pick;
             }
             await Task.Delay(500, ct);
         }
@@ -299,6 +348,13 @@ public sealed class AutoRunCoordinator
 
     private bool IsResting(string accountId, long now) =>
         _restUntilTick.TryGetValue(accountId, out var until) && now < until;
+
+    /// <summary>Đánh dấu account dính verify/captcha: loại khỏi pool của lượt này + báo UI chuyển sang tab Lỗi.</summary>
+    private void MarkErrored(InstanceConfig account, string reason)
+    {
+        lock (_accLock) _errored.Add(account.Id);
+        AccountErrored?.Invoke(account.Id, reason);
+    }
 
     private void ReleaseAccount(InstanceConfig account, bool rest)
     {
@@ -310,3 +366,4 @@ public sealed class AutoRunCoordinator
         }
     }
 }
+

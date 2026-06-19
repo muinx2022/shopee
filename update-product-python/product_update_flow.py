@@ -14,12 +14,7 @@ from bigseller_edit_page import (
 )
 from product_name_rewrite import REWRITTEN_PRODUCT_NAME_HEADER
 from product_runtime import log
-from product_workbook import (
-    MISSING_REWRITTEN_NAME_FILL_COLOR,
-    REWRITTEN_NAME_OK_FILL_COLOR,
-    mark_workbook_row,
-    parse_price,
-)
+from product_workbook import parse_price
 from video_uploader import MAX_VIDEO_DURATION_SECONDS, get_video_duration_seconds, upload_video
 
 try:
@@ -66,8 +61,6 @@ def process_product(edit_page, row_data, config):
     product_name_new = xlsx_result["product_name"]
     price_from_xlsx = xlsx_result["price"]
     index = xlsx_result["line_index"]
-    workbook_path = config.get("WORKBOOK_PATH")
-
     log(f"\n{'='*60}")
     log(f"🚀 BẮT ĐẦU XỬ LÝ | Sheet: {xlsx_result['sheet']} | Dòng: {index} | SKU: {sku}")
     log(f"{'='*60}")
@@ -161,14 +154,22 @@ def process_product(edit_page, row_data, config):
         stock_inputs = edit_page.locator("input[autoid^='variation_stock_text_']")
         count = stock_inputs.count()
         if count > 0:
+            filled_count = 0
+            skipped_zero_count = 0
             for i in range(count):
                 inp = stock_inputs.nth(i)
                 if inp.is_visible():
                     inp.scroll_into_view_if_needed()
+                    current_stock = (inp.input_value() or "").strip()
+                    current_stock_number = int("".join(ch for ch in current_stock if ch.isdigit()) or "0")
+                    if current_stock_number == 0:
+                        skipped_zero_count += 1
+                        continue
                     inp.fill(config['STOCK_VALUE'])
                     inp.evaluate("el => el.dispatchEvent(new Event('input', {bubbles:true}))")
                     inp.evaluate("el => el.blur()")
-            log(f"   => Đã điền {count} ô.")
+                    filled_count += 1
+            log(f"   => Đã điền {filled_count} ô, giữ nguyên {skipped_zero_count} ô tồn kho 0.")
     except: 
         pass
 
@@ -321,13 +322,6 @@ def process_product(edit_page, row_data, config):
     except Exception as e:
         log(f"❌ Lỗi Lưu: {e}")
         return False
-
-    marker_color = REWRITTEN_NAME_OK_FILL_COLOR if xlsx_result.get("has_rewritten_product_name") else MISSING_REWRITTEN_NAME_FILL_COLOR
-    marker_label = "xanh lá" if xlsx_result.get("has_rewritten_product_name") else "xanh dương"
-    if mark_workbook_row(workbook_path, xlsx_result["sheet"], index, marker_color):
-        log(f"✅ Đã tô {marker_label} dòng {index} sau khi update BigSeller thành công.")
-    else:
-        log(f"ℹ️ Không đổi màu dòng {index}, có thể dòng đã được đánh dấu scrape ok màu tím.")
 
     log(f"✅ HOÀN TẤT XỬ LÝ SKU: {sku}")
     return True

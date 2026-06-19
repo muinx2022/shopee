@@ -50,6 +50,21 @@ public sealed class LinkFileStore
         return rows;
     }
 
+    /// <summary>Clears every status cell in the status column (reset resume state).</summary>
+    public void ClearAllStatuses()
+    {
+        using var wb = new XLWorkbook(Path);
+        var ws = wb.Worksheets.First();
+        var lastRow = ws.LastRowUsed()?.RowNumber() ?? 0;
+        var lastCol = ws.LastColumnUsed()?.ColumnNumber() ?? 0;
+        if (lastRow == 0 || lastCol == 0) return;
+
+        var statusCol = ResolveStatusColumn(ws, lastRow, lastCol);
+        for (var r = 1; r <= lastRow; r++)
+            ws.Cell(r, statusCol).Value = "";
+        wb.Save();
+    }
+
     /// <summary>Writes a status value into a row's status column and saves the workbook.</summary>
     public void MarkStatus(int rowNumber, string status)
     {

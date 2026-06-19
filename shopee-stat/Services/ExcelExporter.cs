@@ -25,7 +25,32 @@ public static class ExcelExporter
         var path = Path.Combine(outputDir, fileName);
 
         using var wb = new XLWorkbook();
-        var ws = wb.AddWorksheet("sheet data shop");
+
+        // Mỗi DANH MỤC = 1 sheet (không dồn chung 1 sheet). Sản phẩm không có danh mục → sheet "Khác".
+        // Giữ thứ tự danh mục theo lần xuất hiện đầu tiên để khớp trình tự quét.
+        var groups = results
+            .GroupBy(p => string.IsNullOrWhiteSpace(p.Category) ? "Khác" : p.Category.Trim())
+            .ToList();
+        if (groups.Count == 0)
+            WriteSheet(wb, "sheet data shop", []);
+        else
+        {
+            var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var g in groups)
+                WriteSheet(wb, UniqueSheetName(g.Key, usedNames), g.ToList());
+        }
+
+        var tmpPath = Path.Combine(outputDir,
+            $"{Path.GetFileNameWithoutExtension(fileName)}_{Guid.NewGuid():N}.tmp.xlsx");
+        wb.SaveAs(tmpPath);
+        File.Move(tmpPath, path, overwrite: true);
+
+        return path;
+    }
+
+    private static void WriteSheet(XLWorkbook wb, string sheetName, IReadOnlyList<ProductResult> results)
+    {
+        var ws = wb.AddWorksheet(sheetName);
 
         // Header row
         for (var c = 0; c < Headers.Length; c++)
@@ -68,12 +93,23 @@ public static class ExcelExporter
 
         // Freeze header row
         ws.SheetView.FreezeRows(1);
+    }
 
-        var tmpPath = Path.Combine(outputDir,
-            $"{Path.GetFileNameWithoutExtension(fileName)}_{Guid.NewGuid():N}.tmp.xlsx");
-        wb.SaveAs(tmpPath);
-        File.Move(tmpPath, path, overwrite: true);
+    // Excel: tên sheet ≤ 31 ký tự, không chứa : \ / ? * [ ], không trùng. Trả về tên hợp lệ + duy nhất.
+    private static string UniqueSheetName(string raw, HashSet<string> used)
+    {
+        var clean = new string((raw ?? "").Select(ch => ":\\/?*[]".Contains(ch) ? ' ' : ch).ToArray()).Trim();
+        if (clean.Length == 0) clean = "Khác";
+        if (clean.Length > 31) clean = clean[..31];
 
-        return path;
+        var name = clean;
+        var n = 2;
+        while (!used.Add(name))
+        {
+            var suffix = $" ({n++})";
+            var head = clean.Length + suffix.Length > 31 ? clean[..(31 - suffix.Length)] : clean;
+            name = head + suffix;
+        }
+        return name;
     }
 }

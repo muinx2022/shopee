@@ -206,8 +206,8 @@ async function startSearch(msg) {
     return;
   }
 
-  log('Prepare Shopee filters: sort by best-selling, scroll, then set min price...');
-  const prepResult = await prepareBestSellingAndMinPrice(filters?.minPrice || 100000);
+  log('Prepare Shopee filters: sort by best-selling, scroll...');
+  const prepResult = await prepareBestSelling();
   if (dead()) return;
   if (prepResult) {
     log(`Prepare done: clickedBestSelling=${prepResult.clickedBestSelling}, setPrice=${prepResult.setPrice}, fallbackNavigate=${prepResult.fallbackNavigate}, firstScrollSteps=${prepResult.firstScrollSteps}`);
@@ -322,12 +322,29 @@ async function startShopFromLink(msg) {
   if (dead()) return;
   if (await isNetworkErrorPage()) { reportNetworkError('Không tải được trang sản phẩm.'); return; }
   if (await isVerifyPage()) { state.captchaDetected = true; send({ action: 'captcha' }); return; }
+  // Link chết (SP không tồn tại/đã xoá): báo TERMINAL để coordinator đánh dấu link và sang link
+  // kế — KHÔNG networkError (sẽ đổi account + mở lại đúng link đó vô hạn → "máy mở đi mở lại").
+  if (await isProductNotFoundPage()) { send({ action: 'error', message: 'Sản phẩm không tồn tại — bỏ qua link.' }); return; }
 
   await waitWhilePaused(state); if (dead()) return;
   log('Tìm và bấm "Xem shop"...');
   const okShop = await clickViewShop();
   if (dead()) return;
-  if (!okShop) { reportNetworkError('Không tìm thấy nút "Xem shop" trên trang sản phẩm.'); return; }
+  if (!okShop) {
+    // Trang đã tải xong, không phải verify/lỗi mạng, nhưng không có khối shop → gần như chắc chắn
+    // SP không tồn tại. Chờ thêm 1 nhịp rồi kiểm tra lại để loại trừ trang load chậm; vẫn không có
+    // thì báo TERMINAL (bỏ qua link) thay vì networkError (đổi account + lặp lại link chết).
+    await sleep(1800);
+    if (dead()) return;
+    if (await isVerifyPage()) { state.captchaDetected = true; send({ action: 'captcha' }); return; }
+    if (await isNetworkErrorPage()) { reportNetworkError('Không tải được trang sản phẩm.'); return; }
+    if (await clickViewShop()) {
+      // nhịp chờ thêm đã giúp tìm thấy nút — đi tiếp bình thường.
+    } else {
+      send({ action: 'error', message: 'Không mở được shop (sản phẩm có thể đã bị xoá) — bỏ qua link.' });
+      return;
+    }
+  }
   await waitForTabLoad(searchTabId);
   await sleep(2500 + Math.random() * 1500);
   if (dead()) return;
@@ -354,6 +371,8 @@ async function startShopFromLink(msg) {
   if (dead()) return;
   if (await isVerifyPage()) { state.captchaDetected = true; send({ action: 'captcha' }); return; }
 
+  // Quét toàn bộ "Tất cả sản phẩm" theo TRANG (cách cũ) — KHÔNG click danh mục shop nữa
+  // (cây "Danh Mục" của shop là bộ sưu tập do shop tự đặt, không phải danh mục thật của Shopee).
   const maxPages = 50;
   await crawlPagesForCurrentState(state, link, '', 1, 1, maxPages, true);
   if (dead() || state.captchaDetected) return;
@@ -536,6 +555,42 @@ async function getCurrentTabUrl() {
 async function isVerifyPage() {
   const url = await getCurrentTabUrl();
   return /\/verify\//i.test(url || '');
+}
+
+// Sản phẩm không tồn tại / đã bị xoá: trang Shopee trả 200 nhưng là trang "không tìm thấy".
+// Phân biệt với lỗi mạng/proxy (isNetworkErrorPage) và verify (isVerifyPage) để báo TERMINAL
+// (bỏ qua link, sang link kế) thay vì retry/đổi account vô hạn trên một link chết.
+async function isProductNotFoundPage() {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: searchTabId },
+      world: 'MAIN',
+      func: () => {
+        const body = (document.body?.innerText || '').toLowerCase();
+        const title = (document.title || '').toLowerCase();
+        const markers = [
+          'trang bạn muốn xem không tồn tại',
+          'không tìm thấy trang',
+          'trang không tồn tại',
+          'sản phẩm không tồn tại',
+          'sản phẩm bạn đang tìm',
+          'this page is currently unavailable',
+          'page not found',
+          "the product you're looking for",
+          'the product you are looking for',
+          'oops! the page you',
+        ];
+        const hit = markers.some(m => body.includes(m) || title.includes(m));
+        // PDP thật luôn có khối shop "#sll2-pdp-product-shop" hoặc ".page-product__shop".
+        const hasPdpShop = !!(document.querySelector('#sll2-pdp-product-shop')
+          || document.querySelector('.page-product__shop'));
+        return hit && !hasPdpShop;
+      },
+    });
+    return res?.result === true;
+  } catch (_) {
+    return false;
+  }
 }
 
 async function isNetworkErrorPage() {
@@ -1292,65 +1347,17 @@ async function resolveBestSellingPoint() {
   } catch (e) { log('resolveBestSellingPoint error: ' + e.message); return { ok: false }; }
 }
 
-// Resolve the min-price input (MAIN world).
-async function resolvePriceInputPoint() {
+// If sort didn't take via the UI, navigate to sales-sorted search URL (MAIN world).
+async function applySalesSortFallbackIfNeeded() {
   try {
     const [res] = await chrome.scripting.executeScript({
       target: { tabId: searchTabId }, world: 'MAIN',
       func: () => {
-        const priceFilter = document.querySelector('fieldset.shopee-price-range-filter, .shopee-price-range-filter');
-        const inputs = priceFilter
-          ? Array.from(priceFilter.querySelectorAll('input.shopee-price-range-filter__input, input'))
-          : Array.from(document.querySelectorAll('input.shopee-price-range-filter__input'));
-        const min = inputs[0];
-        if (!min) return { ok: false };
-        min.scrollIntoView({ block: 'center' });
-        const r = min.getBoundingClientRect();
-        return { ok: r.width > 0 && r.height > 0, x: r.left + r.width / 2, y: r.top + r.height / 2, dpr: window.devicePixelRatio };
-      },
-    });
-    return res?.result ?? { ok: false };
-  } catch (e) { log('resolvePriceInputPoint error: ' + e.message); return { ok: false }; }
-}
-
-// Resolve the price-filter apply button (MAIN world).
-async function resolveApplyButtonPoint() {
-  try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId: searchTabId }, world: 'MAIN',
-      func: () => {
-        const priceFilter = document.querySelector('fieldset.shopee-price-range-filter, .shopee-price-range-filter');
-        const btn = priceFilter?.querySelector('button.shopee-button-solid, button')
-          || Array.from(document.querySelectorAll('button'))
-            .find(b => /apply|ap dung|áp dụng/i.test((b.textContent || '').trim() + ' ' + (b.getAttribute('aria-label') || '')));
-        if (!btn) return { ok: false };
-        btn.scrollIntoView({ block: 'center' });
-        const r = btn.getBoundingClientRect();
-        return { ok: r.width > 0 && r.height > 0, x: r.left + r.width / 2, y: r.top + r.height / 2, dpr: window.devicePixelRatio };
-      },
-    });
-    return res?.result ?? { ok: false };
-  } catch (e) { log('resolveApplyButtonPoint error: ' + e.message); return { ok: false }; }
-}
-
-// If sort/price didn't take via the UI, navigate to the equivalent filtered URL (MAIN world).
-async function applyUrlFallbackIfNeeded(minPriceText) {
-  try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId: searchTabId }, world: 'MAIN',
-      args: [String(minPriceText)],
-      func: (minPriceText) => {
         try {
           const url = new URL(window.location.href);
-          const hasSalesSort = url.searchParams.get('sortBy') === 'sales';
-          const hasPriceRange = url.searchParams.get('fe_filter_options')?.includes(minPriceText) === true;
-          if (!hasSalesSort || !hasPriceRange) {
-            const priceFilterValue = `${minPriceText}▶◀undefined`;
+          if (url.searchParams.get('sortBy') !== 'sales') {
             url.pathname = '/search';
             url.searchParams.set('sortBy', 'sales');
-            url.searchParams.set('fe_filter_options', JSON.stringify([
-              { group_name: 'PRICE_RANGE', values: [priceFilterValue] },
-            ]));
             window.location.href = url.toString();
             return true;
           }
@@ -1359,7 +1366,7 @@ async function applyUrlFallbackIfNeeded(minPriceText) {
       },
     });
     return res?.result === true;
-  } catch (e) { log('applyUrlFallbackIfNeeded error: ' + e.message); return false; }
+  } catch (e) { log('applySalesSortFallbackIfNeeded error: ' + e.message); return false; }
 }
 
 // Trusted CDP scroll: load lazy products then return to the top, driven from here.
@@ -1386,15 +1393,14 @@ async function cdpScrollToLoadThenTop(maxSteps = 24) {
   }
 }
 
-async function prepareBestSellingAndMinPrice(minPrice) {
-  const minPriceText = String(minPrice || 100000);
-  // Trusted CDP path: click sort, scroll to load, type price + apply — all real events.
-  // The URL fallback at the end is the safety net if any UI interaction didn't take.
+async function prepareBestSelling() {
+  // Trusted CDP path: click sort, scroll to load — all real events.
+  // The URL fallback at the end is the safety net if the UI click didn't take.
   try {
     const bs = await resolveBestSellingPoint();
     if (!bs.ok) {
       log('Best-selling button not found for CDP path; using synthetic fallback.');
-      return prepareBestSellingAndMinPriceSynthetic(minPrice);
+      return prepareBestSellingSynthetic();
     }
     let clickedBestSelling = false;
     if (!bs.alreadyPressed) {
@@ -1405,37 +1411,20 @@ async function prepareBestSellingAndMinPrice(minPrice) {
 
     await cdpScrollToLoadThenTop();
 
-    let setPrice = false;
-    const pin = await resolvePriceInputPoint();
-    if (pin.ok) {
-      await sleep(600 + Math.random() * 500);
-      await cdpClickAt(pin.x, pin.y);
-      await cdpGesture({ op: 'type', text: minPriceText, clearFirst: true });
-      await cdpGesture({ op: 'pressKey', key: 'Enter' });
-      setPrice = true;
-      await sleep(500 + Math.random() * 500);
-      const ap = await resolveApplyButtonPoint();
-      if (ap.ok) {
-        await cdpClickAt(ap.x, ap.y);
-        await sleep(3200 + Math.random() * 2000);
-      }
-    }
-
-    const fallbackNavigate = await applyUrlFallbackIfNeeded(minPriceText);
-    return { clickedBestSelling, setPrice, firstScrollSteps: 0, fallbackNavigate };
+    const fallbackNavigate = await applySalesSortFallbackIfNeeded();
+    return { clickedBestSelling, setPrice: false, firstScrollSteps: 0, fallbackNavigate };
   } catch (e) {
-    log('CDP prepareBestSellingAndMinPrice failed, fallback synthetic: ' + e.message);
-    return prepareBestSellingAndMinPriceSynthetic(minPrice);
+    log('CDP prepareBestSelling failed, fallback synthetic: ' + e.message);
+    return prepareBestSellingSynthetic();
   }
 }
 
-async function prepareBestSellingAndMinPriceSynthetic(minPrice) {
+async function prepareBestSellingSynthetic() {
   try {
     const [res] = await chrome.scripting.executeScript({
       target: { tabId: searchTabId },
       world: 'MAIN',
-      args: [String(minPrice || 100000)],
-      func: async (minPriceText) => {
+      func: async () => {
         const sleep = ms => new Promise(r => setTimeout(r, ms));
         const rand = (min, max) => min + Math.random() * (max - min);
         let mouse = {
@@ -1545,61 +1534,24 @@ async function prepareBestSellingAndMinPriceSynthetic(minPrice) {
         }
 
         await sleep(rand(900, 1700));
-        const priceFilter = document.querySelector('fieldset.shopee-price-range-filter, .shopee-price-range-filter');
-        const priceInputs = priceFilter
-          ? Array.from(priceFilter.querySelectorAll('input.shopee-price-range-filter__input, input'))
-          : Array.from(document.querySelectorAll('input.shopee-price-range-filter__input'));
-        const minInput = priceInputs[0] || null;
-        let setPrice = false;
-        if (minInput) {
-          minInput.scrollIntoView({ block: 'center', behavior: 'smooth' });
-          await sleep(rand(600, 1100));
-          await clickElement(minInput);
-          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-          setter.call(minInput, '');
-          minInput.dispatchEvent(new Event('input', { bubbles: true }));
-          await sleep(rand(160, 360));
-          for (const ch of minPriceText) {
-            setter.call(minInput, minInput.value + ch);
-            minInput.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ch }));
-            await sleep(rand(45, 120));
-          }
-          minInput.dispatchEvent(new Event('change', { bubbles: true }));
-          minInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-          minInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-          setPrice = true;
-
-          await sleep(rand(500, 1000));
-          const applyButton = priceFilter?.querySelector('button.shopee-button-solid, button')
-            || Array.from(document.querySelectorAll('button'))
-              .find(b => /apply|ap dung|áp dụng/i.test((b.textContent || '').trim() + ' ' + (b.getAttribute('aria-label') || '')));
-          if (applyButton) await clickElement(applyButton);
-          await sleep(rand(3200, 5200));
-        }
 
         let fallbackNavigate = false;
         try {
           const url = new URL(window.location.href);
-          const hasSalesSort = url.searchParams.get('sortBy') === 'sales';
-          const hasPriceRange = url.searchParams.get('fe_filter_options')?.includes(minPriceText) === true;
-          if (!hasSalesSort || !hasPriceRange) {
-            const priceFilterValue = `${minPriceText}▶◀undefined`;
+          if (url.searchParams.get('sortBy') !== 'sales') {
             url.pathname = '/search';
             url.searchParams.set('sortBy', 'sales');
-            url.searchParams.set('fe_filter_options', JSON.stringify([
-              { group_name: 'PRICE_RANGE', values: [priceFilterValue] },
-            ]));
             window.location.href = url.toString();
             fallbackNavigate = true;
           }
         } catch (_) {}
 
-        return { clickedBestSelling, setPrice, firstScrollSteps, fallbackNavigate };
+        return { clickedBestSelling, setPrice: false, firstScrollSteps, fallbackNavigate };
       },
     });
     return res?.result ?? null;
   } catch (e) {
-    log('prepareBestSellingAndMinPrice error: ' + e.message);
+    log('prepareBestSelling error: ' + e.message);
     return null;
   }
 }

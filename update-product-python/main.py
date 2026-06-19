@@ -1,5 +1,7 @@
 import time
 import argparse
+import hashlib
+import json
 import subprocess
 import os
 import re
@@ -193,6 +195,202 @@ def log(msg):
     _push_status_overlay(msg)
 
 
+def _claim_store_dir():
+    base = Path(CONFIG.get("PROFILE_DIR") or SCRIPT_DIR)
+    store = base.parent / ".update-product-claims"
+    try:
+        store.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        store = SCRIPT_DIR / ".update-product-claims"
+        store.mkdir(parents=True, exist_ok=True)
+    return store
+
+
+def _claim_scope_hash():
+    batch_id = os.environ.get("BIGSELLER_UPDATE_BATCH_ID", "").strip()
+    scope = "|".join(
+        [batch_id] if batch_id else
+        [str(CONFIG.get(key) or "") for key in ("WORKBOOK_PATH", "DATA_SHEET", "SHOP_NAME")]
+    )
+    return hashlib.sha1(scope.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _claim_store_path():
+    return _claim_store_dir() / f"{_claim_scope_hash()}.json"
+
+
+def _claim_lock_path():
+    return _claim_store_dir() / f"{_claim_scope_hash()}.lock"
+
+
+def _read_claim_store(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _write_claim_store(path, claims):
+    temp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(claims, handle, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+
+def cleanup_batch_state():
+    try:
+        cache_dir = Path(os.environ.get("BIGSELLER_PROFILE_DIR") or SCRIPT_DIR).parent / ".update-product-workbook-cache"
+        batch_id = os.environ.get("BIGSELLER_UPDATE_BATCH_ID", "").strip()
+        if batch_id and cache_dir.exists():
+            for file in cache_dir.glob("*.json"):
+                try:
+                    file.unlink()
+                except Exception:
+                    pass
+            for file in cache_dir.glob("*.lock"):
+                try:
+                    file.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def cleanup_update_state(stale_seconds=1800, include_base=False):
+    """Dọn sạch trạng thái Update product (gọi lúc khởi động, kết thúc, và Stop):
+    - Đóng Brave các profile worker `<base>-update-p*` còn sót (orphan, kể cả khi lần trước
+      chạy nhiều worker hơn). Nếu include_base=True (lúc Stop) thì đóng CẢ profile base.
+    - Xóa file claim của batch hiện tại + prune file claim/lock/tmp cũ (theo tuổi) để không
+      tích rác và không kẹt claim chết. Prune theo tuổi an toàn với batch khác đang chạy.
+    - Dọn cache workbook của batch hiện tại.
+    """
+    # Mặc định CHỈ đóng profile worker phụ `<base>-update-p*`. KHÔNG đụng profile base lúc
+    # khởi động vì base vừa là worker0 (open_brave/python finally tự quản) vừa có thể là
+    # profile đang đăng nhập BigSeller thủ công — đóng nó lúc khởi động sẽ phá phiên login.
+    # Lúc Stop (include_base=True) thì người dùng muốn đóng HẾT, gồm cả base.
+    base_profile = (os.environ.get("BIGSELLER_PROFILE_DIR") or "").strip()
+    if base_profile:
+        bp = Path(base_profile)
+        try:
+            workers = [d for d in bp.parent.glob(bp.name + "-update-p*") if d.is_dir()]
+        except Exception:
+            workers = []
+        try:
+            base_port = int(os.environ.get("BIGSELLER_DEBUG_PORT", "0") or "0")
+        except Exception:
+            base_port = 0
+        targets = [(str(bp), base_port)] if include_base else []
+        targets += [(str(prof), 0) for prof in workers]
+        for prof, port in targets:
+            try:
+                terminate_brave_profile(prof, port)
+            except Exception as e:
+                log(f"Cleanup: khong dong duoc Brave {prof}: {e}")
+
+    try:
+        store = _claim_store_dir()
+        current_batch_files = {_claim_store_path().name, _claim_lock_path().name}
+        now = time.time()
+        for pattern in ("*.json", "*.lock", "*.tmp"):
+            for file in store.glob(pattern):
+                try:
+                    if file.name in current_batch_files or (now - file.stat().st_mtime) > stale_seconds:
+                        file.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    cleanup_batch_state()
+
+
+def _with_claim_store(callback, timeout=8):
+    lock_path = _claim_lock_path()
+    deadline = time.time() + timeout
+    handle = None
+    while time.time() < deadline:
+        try:
+            handle = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(handle, str(os.getpid()).encode("ascii", errors="ignore"))
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > 30:
+                    lock_path.unlink()
+            except Exception:
+                pass
+            time.sleep(0.12)
+
+    if handle is None:
+        raise TimeoutError(f"Khong lay duoc claim lock: {lock_path}")
+
+    try:
+        path = _claim_store_path()
+        claims = _read_claim_store(path)
+        now = time.time()
+        if not isinstance(claims.get("_used_ids"), dict):
+            claims["_used_ids"] = {}
+        result = callback(claims, now)
+        _write_claim_store(path, claims)
+        return result
+    finally:
+        try:
+            os.close(handle)
+        except Exception:
+            pass
+        try:
+            lock_path.unlink()
+        except Exception:
+            pass
+
+
+def claim_bigseller_edit_id(claim_key, row_label=""):
+    claim_key = str(claim_key or "").strip()
+    if not claim_key:
+        return False
+
+    owner = f"{os.getpid()}:{CONFIG.get('DEBUG_PORT')}"
+
+    def _claim(claims, now):
+        used_ids = claims.setdefault("_used_ids", {})
+        if claim_key in used_ids:
+            return False
+        used_ids[claim_key] = {
+            "owner": owner,
+            "at": now,
+            "row": row_label,
+        }
+        return True
+
+    return _with_claim_store(_claim)
+
+
+def release_bigseller_claim(claim_key):
+    """Nhả claim đã giữ (chỉ khi do chính worker này giữ) — dùng khi lỗi tạm thời để dòng được thử lại."""
+    claim_key = str(claim_key or "").strip()
+    if not claim_key:
+        return False
+
+    owner = f"{os.getpid()}:{CONFIG.get('DEBUG_PORT')}"
+
+    def _release(claims, now):
+        used_ids = claims.setdefault("_used_ids", {})
+        entry = used_ids.get(claim_key)
+        if isinstance(entry, dict) and entry.get("owner") == owner:
+            del used_ids[claim_key]
+            return True
+        return False
+
+    try:
+        return _with_claim_store(_release)
+    except Exception:
+        return False
+
+
 def patch_module_logs():
     for module_name in (
         "product_processor",
@@ -310,6 +508,8 @@ def apply_cli_args():
     parser.add_argument("--batch-size", type=int, default=CONFIG["BATCH_SIZE"], help="Số tên sản phẩm unique gửi mỗi batch.")
     parser.add_argument("--name-only", action="store_true", help="Chỉ cập nhật cột tên sản phẩm đã sửa trong XLSX rồi dừng.")
     parser.add_argument("--skip-name-update", action="store_true", help="Bỏ qua bước cập nhật cột tên sản phẩm đã sửa trong XLSX.")
+    parser.add_argument("--kill-profile-only", action="store_true", help="Chi dong Brave profile/port hien tai roi thoat.")
+    parser.add_argument("--cleanup-state", action="store_true", help="Dong Brave worker + xoa claim store/cache cua batch roi thoat.")
     args = parser.parse_args()
     CONFIG["DATA_SHEET"] = args.sheet
     CONFIG["START_ROW"] = max(2, args.start_row)
@@ -326,6 +526,8 @@ def apply_cli_args():
     CONFIG["BATCH_SIZE"] = max(1, args.batch_size)
     CONFIG["NAME_ONLY"] = args.name_only
     CONFIG["SKIP_NAME_UPDATE"] = args.skip_name_update
+    CONFIG["KILL_PROFILE_ONLY"] = args.kill_profile_only
+    CONFIG["CLEANUP_STATE"] = args.cleanup_state
 
 
 def find_draft_row_by_name(page, product_name, timeout_ms=30000):
@@ -422,19 +624,26 @@ def _extract_user_data_dir(command_line):
     if idx < 0:
         return ""
 
+    # Trường hợp subprocess bọc NGUYÊN tham số vì path có dấu cách (vd path dưới
+    # "C:\Users\Thuy DTB\..."): command line là `"--user-data-dir=C:\...co dau cach"`,
+    # dấu " nằm TRƯỚC --user-data-dir. Phải lấy tới dấu " đóng, không được split theo space.
+    if idx > 0 and command_line[idx - 1] == '"':
+        end = command_line.find('"', idx)
+        return command_line[idx + len(flag):end] if end > idx else command_line[idx + len(flag):]
+
     value = command_line[idx + len(flag):].lstrip()
     if not value:
         return ""
 
-    if value[0] == '"':
-        end = value.find('"', 1)
-        return value[1:end] if end > 0 else value[1:]
-    if value[0] == "'":
-        end = value.find("'", 1)
+    # Trường hợp chỉ bọc giá trị: --user-data-dir="C:\...co dau cach"
+    if value[0] in ('"', "'"):
+        quote = value[0]
+        end = value.find(quote, 1)
         return value[1:end] if end > 0 else value[1:]
 
-    token = value.split()[0]
-    return token.strip('"')
+    # Không quote: path có thể chứa dấu cách (hiếm) -> cắt tại flag kế tiếp " --", không split theo space.
+    nxt = value.find(" --")
+    return (value[:nxt] if nxt > 0 else value).strip().strip('"')
 
 
 def _command_line_matches_brave_profile(command_line, profile_path, debug_port):
@@ -1180,12 +1389,31 @@ class SequentialUpdateRunner:
                     return "deleted"
                 continue
 
+            # Cross-process: claim dòng theo data-row-key (id sản phẩm BigSeller, ổn định giữa
+            # các worker) TRƯỚC khi mở tab edit. Worker khác đã nhận -> bỏ qua, KHÔNG mở tab,
+            # KHÔNG xóa (để worker chủ xử lý). Đây là chốt chống N worker cùng nhảy vào dòng đầu
+            # danh sách rồi mở/đóng tab thừa (lãng phí ~O(N²) lần mở edit khi chạy song song).
+            row_claim_id = self._listing_row_claim_id(row)
+            row_claim_key = f"row:{row_claim_id}" if row_claim_id else ""
+            if row_claim_key:
+                try:
+                    owned = claim_bigseller_edit_id(row_claim_key, row_label=f"listing_row={row_index + 1}")
+                except Exception as claim_error:
+                    log(f"Khong ghi duoc claim listing row {row_claim_id}: {claim_error}")
+                    owned = True
+                if not owned:
+                    log(f"Listing row #{row_index + 1} (id={row_claim_id}) da co worker khac nhan -> bo qua, khong mo tab.")
+                    continue
+
             result = self._run_listing_row(listing_page, row, edit_link, row_index, listing_edit_id, listing_row_key)
-            if result == "skipped":
-                continue
             if result == "retry":
+                # Lỗi tạm thời (modal chặn click...) -> nhả claim để dòng được thử lại sau.
+                if row_claim_key:
+                    release_bigseller_claim(row_claim_key)
                 return "retry"
-            return result
+            if result is False:
+                return False
+            continue
 
         page_no = _pagination_current_page_label(listing_page)
         log(
@@ -1204,6 +1432,16 @@ class SequentialUpdateRunner:
                 return edit_id
             html = edit_link.evaluate("el => el.outerHTML") or ""
             return extract_listing_edit_id(html)
+        except Exception:
+            return None
+
+    def _listing_row_claim_id(self, row):
+        """data-row-key trên <tr> = id sản phẩm BigSeller (đúng bằng id trong URL /edit/{id}.htm),
+        có sẵn TRƯỚC khi click và giống nhau giữa mọi worker -> dùng làm khóa claim cross-process
+        để chỉ một worker mở tab edit cho mỗi sản phẩm."""
+        try:
+            key = (row.get_attribute("data-row-key") or "").strip()
+            return key or None
         except Exception:
             return None
 
@@ -1234,6 +1472,7 @@ class SequentialUpdateRunner:
 
         edit_page = None
         keep_edit_open = False
+        actual_claim_key = ""
         try:
             dismiss_blocking_modal(listing_page)
             with self.browser_context.expect_page() as edit_info:
@@ -1252,6 +1491,22 @@ class SequentialUpdateRunner:
             register_status_page(edit_page)
             edit_page.wait_for_load_state("domcontentloaded", timeout=30000)
             time.sleep(2)
+
+            actual_edit_id = str(extract_listing_edit_id(edit_page.url) or listing_edit_id or "").strip()
+            if not actual_edit_id:
+                log(f"[edit#{self.edit_seq}] khong lay duoc BigSeller product id tu URL edit -> dong tab, qua row ke tiep.")
+                return "skipped"
+
+            actual_claim_key = f"edit:{actual_edit_id}"
+            try:
+                claimed = claim_bigseller_edit_id(actual_claim_key, row_label=f"listing_row={row_index + 1}")
+            except Exception as claim_error:
+                log(f"[edit#{self.edit_seq}] khong ghi duoc BigSeller product id {actual_edit_id}: {claim_error}")
+                claimed = True
+            if not claimed:
+                log(f"[edit#{self.edit_seq}] BigSeller product id {actual_edit_id} da co worker khac su dung -> dong tab, qua row ke tiep.")
+                return "skipped"
+            log(f"[edit#{self.edit_seq}] da giu BigSeller product id {actual_edit_id}.")
 
             inspection = inspect_edit_page_for_update(edit_page, self.config, log_steps=True)
             shopee_id = str(inspection.get("shopee_id") or "").strip()
@@ -1353,6 +1608,9 @@ class SequentialUpdateRunner:
                     log("⚠️ Modal chặn click nhiều lần -> reload listing rồi thử tiếp.")
                     go_to_draft_page(listing_page, force_reload=True)
                     self.click_blocked_streak = 0
+                # Nhả claim edit-id đã giữ (nếu có) để dòng được thử lại sau, không bị bỏ quên.
+                if actual_claim_key:
+                    release_bigseller_claim(actual_claim_key)
                 return "retry"
             keep_edit_open = True
             return False
@@ -1402,6 +1660,15 @@ if __name__ == "__main__":
     log("Edit mode: first listing row, one edit at a time")
     log(f"📋 Listing URL: {CONFIG['LISTING_URL']}")
     log(f"🔄 Listing reload seconds: {CONFIG['DRAFT_RELOAD_SECONDS']}")
+    if CONFIG.get("CLEANUP_STATE"):
+        include_base = (os.environ.get("BIGSELLER_CLEANUP_INCLUDE_BASE", "0").strip() == "1")
+        cleanup_update_state(include_base=include_base)
+        log("Da don Brave worker + claim store/cache cua batch" + (" (gom ca profile base)." if include_base else "."))
+        exit(0)
+    if CONFIG.get("KILL_PROFILE_ONLY"):
+        terminate_brave_profile(CONFIG["PROFILE_DIR"], CONFIG["DEBUG_PORT"])
+        log("Da dong Brave profile theo yeu cau Stop.")
+        exit(0)
     if CONFIG.get("NAME_ONLY"):
         prepare_rewritten_product_names(
             CONFIG["WORKBOOK_PATH"],
@@ -1564,8 +1831,9 @@ if __name__ == "__main__":
         log(f"\n{'='*60}\n📄 BẮT ĐẦU QUÉT\n{'='*60}")
 
         runner = SequentialUpdateRunner(CONFIG, context)
-        last_listing_reload_at = time.time()
         listing_error_streak = 0
+        # Thời gian chờ khi trang 1 không còn slot cần edit, trước khi reload lại lấy item mới.
+        empty_wait_seconds = max(3, int(CONFIG.get("DRAFT_RELOAD_SECONDS") or 10))
 
         while True:
             try:
@@ -1577,25 +1845,22 @@ if __name__ == "__main__":
                     log("❌ Không kiểm tra được tab BigSeller — dừng script.")
                     break
 
-                if not is_draft_page(bigseller_page) or not is_draft_page_ready(bigseller_page, timeout_ms=1500):
-                    if not go_to_draft_page(bigseller_page, force_reload=False):
-                        listing_error_streak += 1
-                        time.sleep(min(5 + listing_error_streak, 15))
-                        if listing_error_streak >= 5:
-                            log("❌ Không khôi phục được danh sách Shopee sau nhiều lần thử — dừng.")
-                            break
-                        continue
-                    listing_error_streak = 0
+                # Luôn reload (về trang 1) TRƯỚC mỗi lượt quét để worker làm việc trên dữ liệu mới
+                # nhất, không dùng snapshot DOM cũ. Sản phẩm xử lý xong rời danh sách nên trang 1
+                # luôn là các slot cần edit mới nhất -> chỉ cần quét trang 1, không cần pagination.
+                if not go_to_draft_page(bigseller_page, force_reload=True):
+                    listing_error_streak += 1
+                    time.sleep(min(5 + listing_error_streak, 15))
+                    if listing_error_streak >= 5:
+                        log("❌ Không khôi phục được danh sách Shopee sau nhiều lần thử — dừng.")
+                        break
+                    continue
+                listing_error_streak = 0
 
                 result = runner.run_first_listing_row(bigseller_page)
-                listing_error_streak = 0
-                if result is None:
-                    log("Danh sach Shopee trong (khong co dong), doi roi reload lai listing.")
-                    time.sleep(CONFIG['CHECK_INTERVAL'])
-                elif result == LISTING_PAGE_EXHAUSTED:
-                    wrap = advance_listing_after_page_exhausted(bigseller_page)
-                    if wrap == "wrap":
-                        time.sleep(CONFIG['CHECK_INTERVAL'])
+                if result is None or result == LISTING_PAGE_EXHAUSTED:
+                    log(f"Trang 1 het slot can edit -> cho {empty_wait_seconds}s roi reload lai.")
+                    time.sleep(empty_wait_seconds)
                 elif result is False:
                     log("Dung script (loi edit hoac Shopee chan captcha).")
                     break
@@ -1603,17 +1868,6 @@ if __name__ == "__main__":
                     time.sleep(1.2)
                 else:
                     time.sleep(0.8)
-
-                now = time.time()
-                if now - last_listing_reload_at >= CONFIG["DRAFT_RELOAD_SECONDS"]:
-                    log("🔄 Reload danh sách Shopee (chu kỳ)...")
-                    if go_to_draft_page(bigseller_page, force_reload=True):
-                        last_listing_reload_at = now
-                else:
-                    try:
-                        bigseller_page.bring_to_front()
-                    except Exception:
-                        pass
             except Exception as e:
                 log(f"Loi scan listing: {e}")
                 listing_error_streak += 1
@@ -1632,4 +1886,8 @@ if __name__ == "__main__":
 
     except Exception as e: log(f"❌ LỖI TỔNG: {e}")
     finally:
+        try:
+            terminate_brave_profile(CONFIG["PROFILE_DIR"], CONFIG["DEBUG_PORT"])
+        except Exception:
+            pass
         if p: p.stop()

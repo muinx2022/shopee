@@ -70,6 +70,45 @@
     return null;
   };
 
+  const findVariantStockCheckbox = (root) => {
+    const label =
+      root.querySelector('label[for="crawl_inventory"]') ||
+      Array.from(root.querySelectorAll("label")).find((el) =>
+        (el.textContent || "").trim().toLowerCase().includes("scrape variant stock")
+      );
+    const input =
+      root.querySelector("#crawl_inventory") ||
+      root.querySelector('input[type="checkbox"][id="crawl_inventory"]') ||
+      (label?.htmlFor ? root.getElementById?.(label.htmlFor) : null);
+
+    if (input || label) return { input, label };
+
+    for (const host of root.querySelectorAll("*")) {
+      if (host.shadowRoot) {
+        const found = findVariantStockCheckbox(host.shadowRoot);
+        if (found) return found;
+      }
+    }
+
+    return null;
+  };
+
+  const enableVariantStockScrape = async () => {
+    const target = findVariantStockCheckbox(document);
+    if (!target) return false;
+
+    const { input, label } = target;
+    if (input?.checked) return true;
+
+    const clickable = label && isVisible(label) ? label : input;
+    if (clickable && typeof clickable.click === "function") {
+      clickable.click();
+      await sleep(150);
+    }
+
+    return Boolean(input?.checked);
+  };
+
   const notify = async (detail) => {
     try {
       await chrome.runtime.sendMessage({ type: "SCRAPE_RESULT", detail });
@@ -81,8 +120,14 @@
     while (Date.now() - startedAt < MAX_WAIT_MS) {
       const button = searchInRoot(document);
       if (button) {
-        button.click();
+        await enableVariantStockScrape();
+        // Báo kết quả TRƯỚC khi click: click nút crawl của BigSeller thường reload trang,
+        // làm content script bị huỷ trước khi chrome.runtime.sendMessage gửi xong → background
+        // không nhận được SCRAPE_RESULT → timeout 15s rồi re-inject/click lại (vòng lặp
+        // "click scrape → chờ → reload → click scrape"). Gửi trước rồi mới click sẽ chắc chắn
+        // launcher nhận được tín hiệu dù trang có reload ngay sau đó.
         await notify({ ok: true, message: "Đã click nút scrape BigSeller." });
+        button.click();
         return;
       }
       await sleep(STEP_MS);

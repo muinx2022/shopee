@@ -8,7 +8,11 @@
 const SCRAPE_SCRIPT = "content.js";
 const OVERLAY_SCRIPT = "overlay.js";
 const TAB_LOAD_TIMEOUT_MS = 30_000;
-const SCRAPE_WAIT_TIMEOUT_MS = 15_000;
+// Phải >= MAX_WAIT_MS trong content.js (30s tìm nút scrape) + buffer. Nếu nhỏ hơn,
+// waiter ở background hết giờ TRƯỚC khi content.js kịp tìm thấy nút trên trang tải chậm
+// → hiện "Thử lại scrape (lần 1)" rồi inject lại oan, dù nút sắp xuất hiện. Để 33s cho
+// content.js dùng trọn 30s tìm nút, lần scrape đầu không bị retry giả.
+const SCRAPE_WAIT_TIMEOUT_MS = 33_000;
 const CAPTCHA_WAIT_TIMEOUT_MS = 10 * 60_000;
 const CAPTCHA_CHECK_INTERVAL_MS = 2_000;
 const MAX_SCRAPE_RETRIES = 1;
@@ -64,6 +68,35 @@ const getTabSafe = async (tabId) => {
   }
 };
 
+const isScrapeWorkTabUrl = (url) => {
+  if (!url || typeof url !== "string") return false;
+  if (url.startsWith("chrome-extension://")) return false;
+  if (url.startsWith("chrome://") || url.startsWith("brave://")) return false;
+  try {
+    const parsed = new URL(url);
+    if (!/(^|\.)shopee\./i.test(parsed.hostname)) return false;
+    if (/\/buyer\/login/i.test(parsed.pathname)) return false;
+    return true;
+  } catch (_) {
+    return /shopee/i.test(url) && !/buyer\/login/i.test(url);
+  }
+};
+
+/** Tìm tab Shopee đang dùng để scrape — tránh chrome.tabs.create khi tab cũ vẫn còn. */
+const findReuseableScrapeTab = async (preferTabId = null) => {
+  if (preferTabId) {
+    const preferred = await getTabSafe(preferTabId);
+    if (preferred?.id && isScrapeWorkTabUrl(preferred.url)) return preferred.id;
+  }
+
+  const tabs = await chrome.tabs.query({});
+  const candidates = tabs.filter((t) => t.id && isScrapeWorkTabUrl(t.url || ""));
+  if (candidates.length === 0) return null;
+
+  const active = candidates.find((t) => t.active);
+  return active?.id ?? candidates[candidates.length - 1].id;
+};
+
 const openLinkInTab = async (tabId, url) => {
   const existing = await getTabSafe(tabId);
   if (existing?.id) {
@@ -74,6 +107,17 @@ const openLinkInTab = async (tabId, url) => {
       // tab biến mất giữa get và update
     }
   }
+
+  const reuseId = await findReuseableScrapeTab(tabId);
+  if (reuseId) {
+    try {
+      await chrome.tabs.update(reuseId, { url, active: true });
+      return reuseId;
+    } catch (_) {
+      // reuse tab cũng không update được
+    }
+  }
+
   const created = await chrome.tabs.create({ url, active: true });
   return created.id;
 };
@@ -161,6 +205,16 @@ const injectOverlayManager = async (tabId) => {
   } catch (_) {
     return false;
   }
+};
+
+const rearmScrapeClicker = async (tabId) => {
+  // Gỡ cờ guard injected cũ để lần chèn kế clicker chạy lại. Cần khi tab GIỮ NGUYÊN document
+  // (vd. sau khi giải captcha mà trang không reload) — cờ __...ScrapeClickerInjected vẫn = true
+  // sẽ khiến content script return ngay đầu, KHÔNG tìm/click nút scrape.
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => { window.__shopee27052026ScrapeClickerInjected = false; },
+  }).catch(() => {});
 };
 
 const injectScrapeClicker = async (tabId) => {
@@ -424,16 +478,33 @@ globalThis.__launcherExecuteScrapeStep = async (payload) => {
 
     tabId = await openLinkInTab(tabId, link);
 
-    const loaded = await waitForTabComplete(tabId);
+    let loaded = await waitForTabComplete(tabId);
     if (!loaded) {
-      tabId = await openLinkInTab(null, link);
-      const reloaded = await waitForTabComplete(tabId);
-      if (!reloaded) {
+      const stillThere = await getTabSafe(tabId);
+      if (stillThere?.id) {
+        await sleep(1000);
+        loaded = await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS);
+        if (!loaded) {
+          try {
+            await chrome.tabs.update(tabId, { url: link, active: true });
+            loaded = await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS);
+          } catch (_) {
+            tabId = await openLinkInTab(await findReuseableScrapeTab(), link);
+            loaded = await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS);
+          }
+        }
+      } else {
+        tabId = await openLinkInTab(await findReuseableScrapeTab(), link);
+        loaded = await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS);
+      }
+
+      if (!loaded) {
+        const surviving = await getTabSafe(tabId);
         return {
           ok: false,
           scrapeOk: false,
           message: "Tab đã đóng hoặc không tải được trang.",
-          tabId: null,
+          tabId: surviving?.id ?? tabId,
           pageUrl: link,
         };
       }
@@ -490,6 +561,10 @@ globalThis.__launcherExecuteScrapeStep = async (payload) => {
     }
 
     let scrapeWaiterPromise = waitForScrapeResult();
+    // Re-arm CHỈ ở lần chèn đầu của mỗi bước, để ca resume sau captcha (document không reload) vẫn click.
+    // Các lần re-inject sau (retry/post-captcha/beforeNext) tự reset guard riêng nên không cần ở đây —
+    // tránh gỡ guard vô tội vạ gây click-trùng → reload lặp.
+    await rearmScrapeClicker(tabId);
     const injected = await injectScrapeClicker(tabId);
     if (!injected) {
       captchaWait = await waitForCaptchaToClear(tabId, { instanceName, rowNumber, sku });
@@ -513,12 +588,13 @@ globalThis.__launcherExecuteScrapeStep = async (payload) => {
           }
         }
       }
+      const survivingTab = await getTabSafe(tabId);
       return {
         ok: false,
         scrapeOk: false,
         captcha: !captchaWait.ok || Boolean(captchaWait.waited),
         message: "Không inject được scrape clicker (tab có thể đã đóng).",
-        tabId: null,
+        tabId: survivingTab?.id ?? tabId,
         pageUrl: link,
       };
     }
@@ -552,7 +628,7 @@ globalThis.__launcherExecuteScrapeStep = async (payload) => {
 
     for (let retry = 1; retry <= MAX_SCRAPE_RETRIES && !scrapeResult?.ok && !abortRequested; retry++) {
       if (!(await getTabSafe(tabId))) {
-        tabId = await openLinkInTab(null, link);
+        tabId = await openLinkInTab(await findReuseableScrapeTab(), link);
         await waitForTabComplete(tabId);
         await injectOverlayManager(tabId);
       }

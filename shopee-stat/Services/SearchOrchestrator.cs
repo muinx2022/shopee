@@ -1,4 +1,4 @@
-﻿namespace ShopeeStatApp.Services;
+namespace ShopeeStatApp.Services;
 
 public sealed class SearchOrchestrator
 {
@@ -98,7 +98,7 @@ public sealed class SearchOrchestrator
         await _ws.SendAsync(new { action = "stop" });
     }
 
-    /// <summary>Pauses the live crawl: the extension waits at the next safe point. Brave/WS stay alive.</summary>
+    /// <summary>Pauses the live crawl: the extension waits at the next safe point. Edge/WS stay alive.</summary>
     public async Task PauseAsync()
     {
         await _ws.SendAsync(new { action = "pause" });
@@ -224,26 +224,12 @@ public sealed class SearchOrchestrator
             var added = 0;
             var updatedOrDuplicate = 0;
             var skippedByRegion = 0;
-            var skippedBySold = 0;
-            var skippedByPrice = 0;
+            // Lưu CSDL TOÀN BỘ sản phẩm — không lọc theo bán/tháng hay giá khi crawl. Việc lọc (min bán
+            // từ–đến, min giá) chỉ áp dụng khi hiển thị + xuất Excel ở phía form.
             foreach (var it in itemsEl.EnumerateArray())
             {
                 var price = GetLong(it, "price");
                 var sold  = GetInt(it, "sold");
-                if (_searchConfig is not null && sold < _searchConfig.MinMonthlySold)
-                {
-                    skippedBySold++;
-                    continue;
-                }
-
-                // Shop-from-link mode has no Shopee price-range filter UI, so enforce min price here.
-                // Only drop when a price was actually parsed (>0); don't lose items whose price failed to parse.
-                if (_searchConfig is { FilterPriceClientSide: true } && price > 0 && price < _searchConfig.MinPriceVnd)
-                {
-                    skippedByPrice++;
-                    continue;
-                }
-
                 var location = GetStr(it, "location");
                 if (!MatchesRegionFilter(location, _searchConfig?.RegionFilterText))
                 {
@@ -273,7 +259,7 @@ public sealed class SearchOrchestrator
                 else
                     updatedOrDuplicate++;
             }
-            ProgressChanged?.Invoke($"[pageData/{srcName}] received {totalReceived}, added {added}, updated/duplicate {updatedOrDuplicate}, skipped sold {skippedBySold}, skipped price {skippedByPrice}, skipped region {skippedByRegion}, total {_results.Count}.");
+            ProgressChanged?.Invoke($"[pageData/{srcName}] received {totalReceived}, added {added}, updated/duplicate {updatedOrDuplicate}, skipped region {skippedByRegion}, total {_results.Count}.");
             if (IsFinalPageData(source))
                 SearchCompleted?.Invoke();
             return;
@@ -400,7 +386,7 @@ public sealed class SearchOrchestrator
 
         return sb.ToString()
             .Normalize(System.Text.NormalizationForm.FormC)
-            .Replace("đ", "d")
+            .Replace("d", "d")
             .Replace(".", " ")
             .Replace("-", " ")
             .Replace("_", " ")
@@ -420,3 +406,4 @@ public sealed class SearchOrchestrator
     private static string GetStr(JsonElement el, string key) =>
         el.TryGetProperty(key, out var v) ? v.GetString() ?? "" : "";
 }
+

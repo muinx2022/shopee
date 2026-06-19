@@ -1,4 +1,4 @@
-﻿namespace ShopeeStatApp.Forms;
+namespace ShopeeStatApp.Forms;
 
 public sealed class MainForm : Form
 {
@@ -10,7 +10,7 @@ public sealed class MainForm : Form
     // Services
     private readonly AppSettingsService _appSettings = new();
     private readonly SearchTaskStore _taskStore = new();
-    private readonly BraveManager _brave;
+    private readonly EdgeManager _edge;
     private WebSocketServer? _ws;
     private SearchOrchestrator? _orchestrator;
     private CdpInputController? _cdpInput;
@@ -21,8 +21,6 @@ public sealed class MainForm : Form
     // Tab 1 - Search
     private readonly ComboBox _keywordBox;
     private readonly TextBox _locationBox;
-    private readonly NumericUpDown _minPriceBox;
-    private readonly NumericUpDown _minSoldBox;
     private readonly ComboBox _accountCombo;
     private readonly Button _startBtn;
     private readonly Button _autoBtn;
@@ -31,6 +29,7 @@ public sealed class MainForm : Form
     private readonly Button _stopBtn;
     private readonly Button _exportBtn;
     private readonly Button _exportAllBtn;
+    private readonly Button _clearKeywordSearchBtn;
     private readonly Button _openTestBtn;
     private readonly ToolTip _toolTip = new();
     private bool _isPaused;
@@ -59,13 +58,21 @@ public sealed class MainForm : Form
     // Tab - Tìm theo file (chạy song song: mỗi file = 1 lane = 1 account)
     private readonly TextBox _fileBox;
     private readonly Button _chooseFileBtn;
+    private readonly Button _clearFileListBtn;
     private readonly NumericUpDown _fileMinPriceBox;
-    private readonly NumericUpDown _fileMinSoldBox;
+    private readonly NumericUpDown _fileMinSoldFromBox;
+    private readonly NumericUpDown _fileMinSoldToBox;
+    private readonly ComboBox _fileCategoryCombo;
+    private readonly Button _fileApplyFilterBtn;
+    private readonly NumericUpDown _fileProcessBox;
+    private const string AllCategoriesItem = "(Tất cả danh mục)";
     private readonly Button _fileRunBtn;
     private readonly Button _fileStopBtn;
     private readonly Button _fileExportBtn;
     private readonly Button _fileExportAllBtn;
     private readonly Button _fileRescanBtn;
+    private readonly Button _clearFileSearchBtn;
+    private readonly Button _fileUpdateCatBtn;
     private readonly TabControl _fileLaneTabs;
     private readonly TextBox _fileLogBox;
     private readonly Spinner _fileSpinner;
@@ -75,7 +82,20 @@ public sealed class MainForm : Form
     private FileRunCoordinator? _fileCoordinator;
     private ScannedShopStore? _fileShopStore;   // shared store for the current run (used by Rescan)
     private bool _fileRunning;
-    private const string ShopExportDir = @"D:\shopee-stat";
+    private const string ShopExportDir = @"D:\shopee-stat\shops";
+
+    // Tab - Danh mục (từ điển danh mục, tự upsert khi quét shop)
+    private readonly DataGridView _categoriesGrid;
+    private readonly DataGridView _categoryProductsGrid;
+    private readonly Button _refreshCategoriesBtn;
+    private readonly Button _updateCategoriesBtn;
+    private readonly Button _updateFileCategoriesBtn;
+    private readonly Spinner _categoriesSpinner;
+    private readonly Label _categoriesCountLabel;
+    private bool _updatingCategories;
+    // Cập nhật danh mục bằng AI: file danh mục tham chiếu + OpenAI key.
+    private const string CategoryDocxPath = @"D:\Projects\shopee-27052026\shopee-cat.docx";
+    private const string OpenAiKeyPath = @"D:\Projects\shopee-27052026\openai.key";
 
     private sealed class FileLaneUi
     {
@@ -88,15 +108,21 @@ public sealed class MainForm : Form
         public long ShownShopId;
     }
 
-    // Tab 2 - Accounts
-    private readonly DataGridView _accountsGrid;
+    // Tab 2 - Accounts (2 sub-tab: "Bình thường" + "Lỗi")
+    private readonly TabControl _accountInnerTabs;
+    private readonly DataGridView _accountsGrid;       // tab "Bình thường"
+    private readonly DataGridView _errorAccountsGrid;  // tab "Lỗi" (dính verify/captcha)
     private readonly Button _importBtn;
     private readonly Button _addAccountBtn;
     private readonly Button _editAccountBtn;
     private readonly Button _deleteAccountBtn;
+    private readonly Button _markErrorBtn;
+    private readonly Button _recoverBtn;
+    private readonly Button _solveCaptchaBtn;
 
     // Tab 3 - Keywords
     private readonly DataGridView _keywordsGrid;
+    private readonly Button _importKeywordBtn;
     private readonly Button _addKeywordBtn;
     private readonly Button _editKeywordBtn;
     private readonly Button _deleteKeywordBtn;
@@ -113,7 +139,7 @@ public sealed class MainForm : Form
     public MainForm()
     {
         _appSettings.Load();
-        _brave = new BraveManager(_appSettings);
+        _edge = new EdgeManager(_appSettings);
 
         Text = "Shopee Stat";
         StartPosition = FormStartPosition.CenterScreen;
@@ -128,7 +154,10 @@ public sealed class MainForm : Form
             Dock = DockStyle.Fill,
             DrawMode = TabDrawMode.OwnerDrawFixed,
             SizeMode = TabSizeMode.Fixed,
-            ItemSize = new Size(LogicalToDeviceUnits(170), LogicalToDeviceUnits(40)),
+            // Multiline: khi nhiều tab vượt bề rộng cửa sổ (DPI cao), tab xuống hàng 2 thay vì bị ẩn
+            // sau mũi tên cuộn — tránh "mất" tab cuối (vd tab "Danh mục").
+            Multiline = true,
+            ItemSize = new Size(LogicalToDeviceUnits(160), LogicalToDeviceUnits(40)),
         };
         var tabFont = new Font("Segoe UI", 10.5f);
         var tabFontBold = new Font("Segoe UI", 10.5f, FontStyle.Bold);
@@ -153,28 +182,31 @@ public sealed class MainForm : Form
         tabs.SelectedIndexChanged += (_, _) => tabs.Invalidate();
 
         // Tab 1: Tìm kiếm
-        (_keywordBox, _locationBox, _minPriceBox, _minSoldBox,
-         _accountCombo, _startBtn, _autoBtn, _resumeFailedBtn, _pauseBtn, _stopBtn, _exportBtn, _exportAllBtn, _openTestBtn,
+        (_keywordBox, _locationBox,
+         _accountCombo, _startBtn, _autoBtn, _resumeFailedBtn, _pauseBtn, _stopBtn, _exportBtn, _exportAllBtn, _clearKeywordSearchBtn, _openTestBtn,
          _statusLabel, _resultCountLabel, _searchSpinner, _grid, _logBox, _wsStatusLabel) = BuildSearchTab(out var tab1);
         tabs.TabPages.Add(tab1);
 
         // Tab: Tìm theo file
-        (_fileBox, _chooseFileBtn, _fileMinPriceBox, _fileMinSoldBox,
-         _fileRunBtn, _fileStopBtn, _fileExportBtn, _fileExportAllBtn, _fileRescanBtn, _fileLaneTabs, _fileLogBox, _fileSpinner, _fileStatusLabel) = BuildFileTab(out var tabFile);
+        (_fileBox, _chooseFileBtn, _clearFileListBtn, _fileMinPriceBox, _fileMinSoldFromBox, _fileMinSoldToBox, _fileCategoryCombo, _fileApplyFilterBtn, _fileProcessBox,
+         _fileRunBtn, _fileStopBtn, _fileExportBtn, _fileExportAllBtn, _fileRescanBtn, _fileUpdateCatBtn, _clearFileSearchBtn, _fileLaneTabs, _fileLogBox, _fileSpinner, _fileStatusLabel) = BuildFileTab(out var tabFile);
         tabs.TabPages.Add(tabFile);
 
         // Tab 2: Tài khoản
-        (_accountsGrid, _importBtn, _addAccountBtn, _editAccountBtn, _deleteAccountBtn) =
+        (_accountInnerTabs, _accountsGrid, _errorAccountsGrid, _importBtn, _addAccountBtn, _editAccountBtn, _deleteAccountBtn, _markErrorBtn, _recoverBtn, _solveCaptchaBtn) =
             BuildAccountsTab(out var tab2);
         tabs.TabPages.Add(tab2);
 
-        (_keywordsGrid, _addKeywordBtn, _editKeywordBtn, _deleteKeywordBtn, _markUnusedKeywordBtn, _selectAllKeywordsBtn) =
+        (_keywordsGrid, _importKeywordBtn, _addKeywordBtn, _editKeywordBtn, _deleteKeywordBtn, _markUnusedKeywordBtn, _selectAllKeywordsBtn) =
             BuildKeywordsTab(out var tabKeywords);
         tabs.TabPages.Add(tabKeywords);
 
         (_tasksGrid, _resumeTaskBtn, _researchTaskBtn, _exportTaskBtn, _refreshTasksBtn) =
             BuildTasksTab(out var tabTasks);
         tabs.TabPages.Add(tabTasks);
+
+        (_categoriesGrid, _categoryProductsGrid, _refreshCategoriesBtn, _updateCategoriesBtn, _updateFileCategoriesBtn, _categoriesSpinner, _categoriesCountLabel) = BuildCategoriesTab(out var tabCategories);
+        tabs.TabPages.Add(tabCategories);
 
         Controls.Add(tabs);
         FormClosing += OnFormClosing;
@@ -184,6 +216,9 @@ public sealed class MainForm : Form
         RefreshKeywordCombo();
         RefreshKeywordsGrid();
         RefreshTasksGrid();
+        RefreshCategoriesGrid();
+        RefreshFileCategoryCombo();
+        _fileProcessBox.Value = Math.Clamp(_appSettings.Settings.LastFileProcessCount, 1, 999);
 
         BuildParallelControls();
 
@@ -195,8 +230,8 @@ public sealed class MainForm : Form
 
     // Build helpers
 
-    private static (ComboBox keyword, TextBox location, NumericUpDown minPrice, NumericUpDown minSold,
-        ComboBox account, Button start, Button auto, Button resumeFailed, Button pause, Button stop, Button export, Button exportAll, Button openTest,
+    private static (ComboBox keyword, TextBox location,
+        ComboBox account, Button start, Button auto, Button resumeFailed, Button pause, Button stop, Button export, Button exportAll, Button clearSearch, Button openTest,
         Label status, Label resultCount, Spinner spinner, DataGridView grid, TextBox logBox, Label wsStatus)
         BuildSearchTab(out TabPage page)
     {
@@ -233,17 +268,11 @@ public sealed class MainForm : Form
             DropDownStyle = ComboBoxStyle.DropDownList,
         };
         var location = LabeledBox("", 120, "Hà Nội");
-        var (_, minPrice) = LabeledNumeric("Giá tối thiểu:", 100_000, 0, 100_000_000, 10_000);
-        var (_, minSold) = LabeledNumeric("Lượt bán/tháng >=:", 50, 0, 999_999, 10);
 
         paramPanel.Controls.Add(MakeLabel("Từ khóa:"));
         paramPanel.Controls.Add(keyword);
         paramPanel.Controls.Add(MakeLabel("  Khu vực:"));
         paramPanel.Controls.Add(location);
-        paramPanel.Controls.Add(MakeLabel("  Giá min (VND):"));
-        paramPanel.Controls.Add(minPrice);
-        paramPanel.Controls.Add(MakeLabel("  Bán/tháng >=:"));
-        paramPanel.Controls.Add(minSold);
         outer.Controls.Add(paramPanel, 0, 0);
 
         // Row 1: account selector + ws status
@@ -282,6 +311,7 @@ public sealed class MainForm : Form
         var stopBtn = new Button { Text = "■ Dừng", Width = 85, Height = 30 };
         var exportBtn = new Button { Text = "⬇ Xuất Excel", Width = 115, Height = 30 };
         var exportAllBtn = new Button { Text = "⬇⬇ Xuất tất cả (gộp)", Width = 165, Height = 30 };
+        var clearSearchBtn = new Button { Text = "Xóa dữ liệu tìm kiếm", Width = 165, Height = 30, ForeColor = Color.FromArgb(180, 40, 40) };
         var openTestBtn = new Button { Text = "🌐 Mở test", Width = 105, Height = 30 };
 
         actPanel.Controls.Add(startBtn);
@@ -291,6 +321,7 @@ public sealed class MainForm : Form
         actPanel.Controls.Add(stopBtn);
         actPanel.Controls.Add(exportBtn);
         actPanel.Controls.Add(exportAllBtn);
+        actPanel.Controls.Add(clearSearchBtn);
         actPanel.Controls.Add(new Label { Width = 16 });
         actPanel.Controls.Add(openTestBtn);
         outer.Controls.Add(actPanel, 0, 2);
@@ -356,13 +387,13 @@ public sealed class MainForm : Form
         };
         outer.Controls.Add(logBox, 0, 6);
 
-        return (keyword, location, minPrice, minSold,
-                accountCombo, startBtn, autoBtn, resumeFailedBtn, pauseBtn, stopBtn, exportBtn, exportAllBtn, openTestBtn,
+        return (keyword, location,
+                accountCombo, startBtn, autoBtn, resumeFailedBtn, pauseBtn, stopBtn, exportBtn, exportAllBtn, clearSearchBtn, openTestBtn,
                 statusLabel, resultCountLabel, spinner, grid, logBox, wsStatus);
     }
 
-    private static (TextBox fileBox, Button chooseBtn, NumericUpDown minPrice, NumericUpDown minSold,
-        Button run, Button stop, Button export, Button exportAll, Button rescan, TabControl laneTabs, TextBox logBox, Spinner spinner, Label status)
+    private static (TextBox fileBox, Button chooseBtn, Button clearList, NumericUpDown minPrice, NumericUpDown minSoldFrom, NumericUpDown minSoldTo, ComboBox fileCategory, Button applyFilter, NumericUpDown processCount,
+        Button run, Button stop, Button export, Button exportAll, Button rescan, Button updateCat, Button clearSearch, TabControl laneTabs, TextBox logBox, Spinner spinner, Label status)
         BuildFileTab(out TabPage page)
     {
         page = new TabPage("Tìm theo file");
@@ -381,21 +412,51 @@ public sealed class MainForm : Form
         outer.RowStyles.Add(new RowStyle(SizeType.Absolute, 140)); // 4: log
         page.Controls.Add(outer);
 
-        // Row 0: file picker (nhiều file) + min price/sold + gợi ý song song
-        var fileRow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Padding = new Padding(0, 4, 0, 4) };
-        var fileBox = new TextBox { Width = 300, ReadOnly = true, PlaceholderText = "Chọn nhiều file .xlsx chứa link sản phẩm..." };
+        // Row 0: gói 2 hàng — hàng chọn file + Process, hàng bộ lọc — để không bị tràn/rớt dòng.
+        var topPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(0, 4, 0, 2) };
+
+        // Hàng 0a: chọn file + Process
+        var fileRow = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0, 0, 0, 2) };
+        var fileBox = new TextBox { Width = 320, ReadOnly = true, PlaceholderText = "Chọn nhiều file .xlsx chứa link sản phẩm..." };
         var chooseBtn = new Button { Text = "Chọn file...", Width = 100, Height = 26 };
-        var (_, minPrice) = LabeledNumeric("Giá tối thiểu:", 100_000, 0, 100_000_000, 10_000);
-        var (_, minSold) = LabeledNumeric("Đã bán min:", 1, 0, 999_999, 10);
+        var clearListBtn = new Button { Text = "🗑 Xóa danh sách", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8, 0, 8, 0), Height = 26, ForeColor = Color.FromArgb(180, 40, 40) };
+        var (_, processCount) = LabeledNumeric("Process:", 1, 1, 999, 1);
         fileRow.Controls.Add(MakeLabel("File:"));
         fileRow.Controls.Add(fileBox);
         fileRow.Controls.Add(chooseBtn);
-        fileRow.Controls.Add(new Label { Width = 16 });
-        fileRow.Controls.Add(MakeLabel("Giá min (VND):"));
-        fileRow.Controls.Add(minPrice);
-        fileRow.Controls.Add(MakeLabel("  Đã bán min:"));
-        fileRow.Controls.Add(minSold);
-        outer.Controls.Add(fileRow, 0, 0);
+        fileRow.Controls.Add(clearListBtn);
+        fileRow.Controls.Add(new Label { Width = 24 });
+        fileRow.Controls.Add(MakeLabel("Process:"));
+        fileRow.Controls.Add(processCount);
+
+        // Hàng 0b: bộ lọc (chỉ để hiển thị + xuất Excel) + nút Áp dụng
+        var filterRow = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0, 2, 0, 2) };
+        // Mặc định 0 = KHÔNG lọc (lấy toàn bộ). Người dùng tự đặt rồi bấm "Áp dụng".
+        var (_, minPrice) = LabeledNumeric("Giá tối thiểu:", 0, 0, 100_000_000, 10_000);
+        // Khoảng "bán/tháng": 0 = không giới hạn. Chỉ dùng để LỌC khi hiển thị + xuất Excel
+        // (crawl vẫn lưu CSDL toàn bộ sản phẩm).
+        var (_, minSoldFrom) = LabeledNumeric("Bán/tháng từ:", 0, 0, 999_999, 10);
+        var (_, minSoldTo) = LabeledNumeric("đến:", 0, 0, 999_999, 10);
+        // Lọc theo danh mục (áp cho cả bảng hiển thị + xuất Excel). Để "(Tất cả danh mục)" = không lọc.
+        var fileCategory = new ComboBox { Width = 220, DropDownStyle = ComboBoxStyle.DropDownList };
+        fileCategory.Items.Add(AllCategoriesItem);
+        fileCategory.SelectedIndex = 0;
+        var applyFilter = new Button { Text = "Áp dụng", Width = 90, Height = 26, Margin = new Padding(8, 0, 0, 0) };
+        filterRow.Controls.Add(MakeLabel("Lọc (hiển thị/xuất):"));
+        filterRow.Controls.Add(MakeLabel("  Giá min (VND):"));
+        filterRow.Controls.Add(minPrice);
+        filterRow.Controls.Add(MakeLabel("  Bán/tháng từ:"));
+        filterRow.Controls.Add(minSoldFrom);
+        filterRow.Controls.Add(MakeLabel("  đến:"));
+        filterRow.Controls.Add(minSoldTo);
+        filterRow.Controls.Add(MakeLabel("  Danh mục:"));
+        filterRow.Controls.Add(fileCategory);
+        filterRow.Controls.Add(applyFilter);
+        filterRow.Controls.Add(MakeLabel("  (0 = không giới hạn)"));
+
+        topPanel.Controls.Add(fileRow);
+        topPanel.Controls.Add(filterRow);
+        outer.Controls.Add(topPanel, 0, 0);
 
         // Row 1: action buttons + info song song
         var actPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Padding = new Padding(0, 0, 0, 4) };
@@ -404,15 +465,19 @@ public sealed class MainForm : Form
         var export = new Button { Text = "⬇ Xuất link đang chọn", Width = 175, Height = 30 };
         var exportAll = new Button { Text = "⬇⬇ Xuất tất cả", Width = 130, Height = 30 };
         var rescan = new Button { Text = "↻ Quét lại link đang chọn", Width = 190, Height = 30 };
+        var updateCat = new Button { Text = "🤖 Cập nhật danh mục (AI)", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8, 0, 8, 0), Height = 30 };
+        var clearSearch = new Button { Text = "Xóa dữ liệu tìm kiếm", Width = 165, Height = 30, ForeColor = Color.FromArgb(180, 40, 40) };
         actPanel.Controls.Add(run);
         actPanel.Controls.Add(stop);
         actPanel.Controls.Add(new Label { Width = 16 });
         actPanel.Controls.Add(export);
         actPanel.Controls.Add(exportAll);
         actPanel.Controls.Add(rescan);
+        actPanel.Controls.Add(updateCat);
+        actPanel.Controls.Add(clearSearch);
         var spinner = new Spinner { Anchor = AnchorStyles.Left, Margin = new Padding(12, 0, 0, 0) };
         actPanel.Controls.Add(spinner);
-        var info = MakeLabel("  (mỗi file 1 tài khoản · chạy song song · tối đa = số tài khoản)");
+        var info = MakeLabel("  (chạy tối đa theo ô Process · mỗi process dùng 1 tài khoản)");
         info.ForeColor = Color.Gray;
         actPanel.Controls.Add(info);
         outer.Controls.Add(actPanel, 0, 1);
@@ -446,7 +511,7 @@ public sealed class MainForm : Form
         };
         outer.Controls.Add(logBox, 0, 4);
 
-        return (fileBox, chooseBtn, minPrice, minSold, run, stop, export, exportAll, rescan, laneTabs, logBox, spinner, status);
+        return (fileBox, chooseBtn, clearListBtn, minPrice, minSoldFrom, minSoldTo, fileCategory, applyFilter, processCount, run, stop, export, exportAll, rescan, updateCat, clearSearch, laneTabs, logBox, spinner, status);
     }
 
     // One links grid (Dòng/Link/Trạng thái) for a file lane.
@@ -462,7 +527,8 @@ public sealed class MainForm : Form
             RowHeadersWidth = 30,
         };
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Row", HeaderText = "Dòng", FillWeight = 12, MinimumWidth = 50 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Link", HeaderText = "Link sản phẩm", FillWeight = 58, MinimumWidth = 160 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Link", HeaderText = "Link sản phẩm", FillWeight = 48, MinimumWidth = 160 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Shop", HeaderText = "Shop", FillWeight = 20, MinimumWidth = 90 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "Trạng thái", FillWeight = 30, MinimumWidth = 110 });
         return grid;
     }
@@ -479,14 +545,15 @@ public sealed class MainForm : Form
             AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
             RowHeadersWidth = 30,
         };
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Link", HeaderText = "Link", FillWeight = 40, MinimumWidth = 140 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Tên sản phẩm", FillWeight = 36, MinimumWidth = 150 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Price", HeaderText = "Giá", FillWeight = 12, MinimumWidth = 70 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Sold", HeaderText = "Bán/tháng", FillWeight = 12, MinimumWidth = 70 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Link", HeaderText = "Link", FillWeight = 34, MinimumWidth = 140 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Tên sản phẩm", FillWeight = 32, MinimumWidth = 150 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Category", HeaderText = "Danh mục", FillWeight = 18, MinimumWidth = 100 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Price", HeaderText = "Giá", FillWeight = 10, MinimumWidth = 70 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Sold", HeaderText = "Bán/tháng", FillWeight = 10, MinimumWidth = 70 });
         return grid;
     }
 
-    private static (DataGridView grid, Button importBtn, Button addBtn, Button editBtn, Button deleteBtn)
+    private static (TabControl innerTabs, DataGridView grid, DataGridView errorGrid, Button importBtn, Button addBtn, Button editBtn, Button deleteBtn, Button markErrorBtn, Button recoverBtn, Button solveCaptchaBtn)
         BuildAccountsTab(out TabPage page)
     {
         page = new TabPage("Tài khoản");
@@ -506,30 +573,54 @@ public sealed class MainForm : Form
         var addBtn = new Button { Text = "+ Thêm", Width = 80, Height = 28 };
         var editBtn = new Button { Text = "Sửa", Width = 70, Height = 28 };
         var deleteBtn = new Button { Text = "Xóa", Width = 70, Height = 28, ForeColor = Color.FromArgb(180, 40, 40) };
+        var markErrorBtn = new Button { Text = "Đánh dấu lỗi →", Width = 120, Height = 28, ForeColor = Color.FromArgb(180, 40, 40) };
+        var solveCaptchaBtn = new Button { Text = "Mở giải captcha", Width = 130, Height = 28, ForeColor = Color.FromArgb(0, 90, 160) };
+        var recoverBtn = new Button { Text = "← Khôi phục", Width = 110, Height = 28, ForeColor = Color.FromArgb(0, 120, 60) };
         btnRow.Controls.Add(importBtn);
         btnRow.Controls.Add(addBtn);
         btnRow.Controls.Add(editBtn);
         btnRow.Controls.Add(deleteBtn);
+        btnRow.Controls.Add(markErrorBtn);
+        btnRow.Controls.Add(solveCaptchaBtn);
+        btnRow.Controls.Add(recoverBtn);
         panel.Controls.Add(btnRow, 0, 0);
 
-        var grid = new DataGridView
+        static DataGridView NewGrid()
         {
-            Dock = DockStyle.Fill,
-            ReadOnly = true,
-            AllowUserToAddRows = false,
-            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
-        };
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Username", HeaderText = "Username", FillWeight = 25 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Proxy", HeaderText = "Proxy", FillWeight = 30 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "Trạng thái", FillWeight = 20 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Profile", HeaderText = "Profile path", FillWeight = 25 });
-        panel.Controls.Add(grid, 0, 1);
+            var g = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                ReadOnly = true,
+                AllowUserToAddRows = false,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = true,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+            };
+            g.Columns.Add(new DataGridViewTextBoxColumn { Name = "Username", HeaderText = "Username", FillWeight = 25 });
+            g.Columns.Add(new DataGridViewTextBoxColumn { Name = "Proxy", HeaderText = "Proxy", FillWeight = 30 });
+            g.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "Trạng thái", FillWeight = 20 });
+            g.Columns.Add(new DataGridViewTextBoxColumn { Name = "Profile", HeaderText = "Profile path", FillWeight = 25 });
+            return g;
+        }
 
-        return (grid, importBtn, addBtn, editBtn, deleteBtn);
+        var grid = NewGrid();
+        var errorGrid = NewGrid();
+        // Tab "Lỗi": cột "Trạng thái" hiển thị lý do + thời điểm bị chặn thay cho ✓/⚠.
+        errorGrid.Columns["Status"].HeaderText = "Lý do / thời điểm";
+
+        var innerTabs = new TabControl { Dock = DockStyle.Fill };
+        var normalPage = new TabPage("Bình thường");
+        var errorPage = new TabPage("Lỗi");
+        normalPage.Controls.Add(grid);
+        errorPage.Controls.Add(errorGrid);
+        innerTabs.TabPages.Add(normalPage);
+        innerTabs.TabPages.Add(errorPage);
+        panel.Controls.Add(innerTabs, 0, 1);
+
+        return (innerTabs, grid, errorGrid, importBtn, addBtn, editBtn, deleteBtn, markErrorBtn, recoverBtn, solveCaptchaBtn);
     }
 
-    private static (DataGridView grid, Button addBtn, Button editBtn, Button deleteBtn, Button markUnusedBtn, Button selectAllBtn)
+    private static (DataGridView grid, Button importBtn, Button addBtn, Button editBtn, Button deleteBtn, Button markUnusedBtn, Button selectAllBtn)
         BuildKeywordsTab(out TabPage page)
     {
         page = new TabPage("Từ khóa");
@@ -545,11 +636,13 @@ public sealed class MainForm : Form
         page.Controls.Add(panel);
 
         var btnRow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Padding = new Padding(0, 0, 0, 4) };
+        var importBtn = new Button { Text = "Import...", Width = 90, Height = 28 };
         var addBtn = new Button { Text = "+ Thêm", Width = 80, Height = 28 };
         var editBtn = new Button { Text = "Sửa", Width = 70, Height = 28 };
         var deleteBtn = new Button { Text = "Xóa", Width = 70, Height = 28, ForeColor = Color.FromArgb(180, 40, 40) };
         var markUnusedBtn = new Button { Text = "Đánh dấu chưa dùng", Width = 150, Height = 28 };
         var selectAllBtn = new Button { Text = "Chọn tất cả", Width = 95, Height = 28 };
+        btnRow.Controls.Add(importBtn);
         btnRow.Controls.Add(addBtn);
         btnRow.Controls.Add(editBtn);
         btnRow.Controls.Add(deleteBtn);
@@ -570,7 +663,7 @@ public sealed class MainForm : Form
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Used", HeaderText = "Trạng thái", FillWeight = 20 });
         panel.Controls.Add(grid, 0, 1);
 
-        return (grid, addBtn, editBtn, deleteBtn, markUnusedBtn, selectAllBtn);
+        return (grid, importBtn, addBtn, editBtn, deleteBtn, markUnusedBtn, selectAllBtn);
     }
 
     private static (DataGridView grid, Button resumeBtn, Button researchBtn, Button exportBtn, Button refreshBtn)
@@ -626,6 +719,379 @@ public sealed class MainForm : Form
         return (grid, resumeBtn, researchBtn, exportBtn, refreshBtn);
     }
 
+    // Tab "Danh mục": trái = từ điển danh mục (tự upsert khi quét shop); phải = sản phẩm của danh mục đang chọn.
+    private static (DataGridView grid, DataGridView productsGrid, Button refresh, Button updateAi, Button updateFile, Spinner spinner, Label count) BuildCategoriesTab(out TabPage page)
+    {
+        page = new TabPage("Danh mục");
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 2,
+            ColumnCount = 1,
+            Padding = new Padding(8),
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        page.Controls.Add(panel);
+
+        var btnRow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(0, 0, 0, 4),
+        };
+        var refreshBtn = new Button { Text = "↻ Làm mới", Width = 100, Height = 28 };
+        var updateAiBtn = new Button { Text = "🤖 Cập nhật danh mục CSDL (AI)", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8, 0, 8, 0), Height = 28, Margin = new Padding(8, 0, 0, 0) };
+        var updateFileBtn = new Button { Text = "📄 Cập nhật danh mục cho file Excel (AI)", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8, 0, 8, 0), Height = 28, Margin = new Padding(8, 0, 0, 0) };
+        var spinner = new Spinner { Anchor = AnchorStyles.Left, Margin = new Padding(12, 4, 0, 0) };
+        var countLabel = MakeLabel("");
+        countLabel.ForeColor = Color.Gray;
+        countLabel.Margin = new Padding(8, 6, 0, 0);
+        btnRow.Controls.Add(refreshBtn);
+        btnRow.Controls.Add(updateAiBtn);
+        btnRow.Controls.Add(updateFileBtn);
+        btnRow.Controls.Add(spinner);
+        btnRow.Controls.Add(countLabel);
+        panel.Controls.Add(btnRow, 0, 0);
+
+        // 2 grid cạnh nhau: trái danh mục, phải sản phẩm theo danh mục.
+        var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Vertical };
+
+        var grid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            ReadOnly = true,
+            AllowUserToAddRows = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            MultiSelect = false,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+        };
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Danh mục", FillWeight = 50, MinimumWidth = 120 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Products", HeaderText = "Số SP", FillWeight = 18 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Shops", HeaderText = "Số shop", FillWeight = 16 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Last", HeaderText = "Lần cuối", FillWeight = 16 });
+        split.Panel1.Controls.Add(grid);
+
+        var productsGrid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            ReadOnly = true,
+            AllowUserToAddRows = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+        };
+        productsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Link", HeaderText = "Link", FillWeight = 30, MinimumWidth = 120 });
+        productsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Tên sản phẩm", FillWeight = 34, MinimumWidth = 150 });
+        productsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Shop", HeaderText = "Shop", FillWeight = 16, MinimumWidth = 90 });
+        productsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Price", HeaderText = "Giá", FillWeight = 10, MinimumWidth = 70 });
+        productsGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Sold", HeaderText = "Bán/tháng", FillWeight = 10, MinimumWidth = 70 });
+        split.Panel2.Controls.Add(productsGrid);
+
+        panel.Controls.Add(split, 0, 1);
+        // Đặt vạch chia ~42% sau khi split có kích thước thật (tránh lỗi SplitterDistance lúc chưa layout).
+        split.HandleCreated += (_, _) =>
+        {
+            try { split.SplitterDistance = Math.Max(200, (int)(split.Width * 0.42)); } catch { }
+        };
+
+        return (grid, productsGrid, refreshBtn, updateAiBtn, updateFileBtn, spinner, countLabel);
+    }
+
+    private void RefreshCategoriesGrid()
+    {
+        List<SearchTaskStore.CategoryRow> rows;
+        try { rows = _taskStore.GetCategories(); }
+        catch (Exception ex) { _categoriesCountLabel.Text = "Lỗi đọc danh mục: " + ex.Message; return; }
+
+        _categoriesGrid.Rows.Clear();
+        foreach (var c in rows)
+        {
+            _categoriesGrid.Rows.Add(
+                c.Name,
+                c.ProductCount.ToString("N0"),
+                c.ShopCount.ToString("N0"),
+                FormatDateString(c.FirstSeen),
+                FormatDateString(c.LastSeen));
+        }
+        _categoriesCountLabel.Text = $"{rows.Count} danh mục";
+        LoadCategoryProductsForSelected();
+    }
+
+    // Nạp sản phẩm của danh mục đang chọn (grid trái) sang grid phải.
+    private void LoadCategoryProductsForSelected()
+    {
+        _categoryProductsGrid.Rows.Clear();
+        var row = _categoriesGrid.CurrentRow
+            ?? (_categoriesGrid.SelectedRows.Count > 0 ? _categoriesGrid.SelectedRows[0] : null);
+        if (row is null) return;
+        var name = Convert.ToString(row.Cells["Name"].Value) ?? "";
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        List<ProductResult> products;
+        try { products = _taskStore.GetShopProductsByCategory(name); }
+        catch { return; }
+        foreach (var p in products)
+            _categoryProductsGrid.Rows.Add(p.Link, p.Name, p.ShopName, p.PriceVnd.ToString("N0"), p.MonthlySold.ToString());
+    }
+
+    // Cập nhật danh mục cho sản phẩm shop bằng OpenAI: đọc danh mục lá từ shopee-cat.docx, phân loại
+    // theo TÊN sản phẩm (gpt-4.1-mini), ghi vào CSDL. Chỉ xử lý sản phẩm CHƯA có danh mục.
+    private async void OnUpdateCategoriesClick(object? sender, EventArgs e)
+    {
+        if (_updatingCategories) return;
+
+        if (!File.Exists(CategoryDocxPath))
+        {
+            MessageBox.Show($"Không thấy file danh mục tham chiếu:\n{CategoryDocxPath}", "Cập nhật danh mục (AI)", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (!File.Exists(OpenAiKeyPath))
+        {
+            MessageBox.Show($"Không thấy file OpenAI key:\n{OpenAiKeyPath}", "Cập nhật danh mục (AI)", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        List<ShopeeCategoryReference.LeafCategory> leaves;
+        try { leaves = ShopeeCategoryReference.LoadLeafCategories(CategoryDocxPath); }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Đọc file danh mục lỗi: " + ex.Message, "Cập nhật danh mục (AI)", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        if (leaves.Count == 0)
+        {
+            MessageBox.Show("Không đọc được danh mục nào từ file .docx.", "Cập nhật danh mục (AI)", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        string apiKey;
+        try { apiKey = CategoryAiUpdater.ReadKey(OpenAiKeyPath); }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Đọc OpenAI key lỗi: " + ex.Message, "Cập nhật danh mục (AI)", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            MessageBox.Show("File OpenAI key rỗng.", "Cập nhật danh mục (AI)", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var products = _taskStore.GetAllShopProductsForCategory();
+        if (products.Count == 0)
+        {
+            MessageBox.Show("Chưa có sản phẩm nào trong CSDL để cập nhật danh mục.", "Cập nhật danh mục (AI)", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (MessageBox.Show(
+                $"Phân loại lại danh mục bằng AI cho TẤT CẢ {products.Count} sản phẩm (GHI ĐÈ danh mục hiện có)\n(dùng {leaves.Count} danh mục lá, model gpt-4.1-mini).\nViệc này gọi OpenAI và có thể mất vài phút. Tiếp tục?",
+                "Cập nhật danh mục (AI)", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        _updatingCategories = true;
+        _updateCategoriesBtn.Enabled = false;
+        _fileUpdateCatBtn.Enabled = false;
+        _updateFileCategoriesBtn.Enabled = false;
+        _refreshCategoriesBtn.Enabled = false;
+        var paths = leaves.Select(l => l.Path).ToList();
+        var updater = new CategoryAiUpdater(apiKey, "gpt-4.1-mini");
+        const int batchSize = 40;
+        var totalUpdated = 0;
+        try
+        {
+            for (var start = 0; start < products.Count; start += batchSize)
+            {
+                var slice = products.GetRange(start, Math.Min(batchSize, products.Count - start));
+                var names = slice.Select(p => p.Name).ToList();
+                _categoriesCountLabel.Text = $"Đang cập nhật danh mục (AI)… {start}/{products.Count}";
+
+                int[] idx;
+                try { idx = await updater.ClassifyAsync(names, paths, CancellationToken.None); }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Gọi OpenAI lỗi (đã cập nhật {totalUpdated} sản phẩm):\n{ex.Message}",
+                        "Cập nhật danh mục (AI)", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    break;
+                }
+
+                var batchUpdates = new List<(long, long, string)>();
+                for (var k = 0; k < slice.Count; k++)
+                {
+                    var ci = idx[k];
+                    if (ci >= 0 && ci < paths.Count)
+                        batchUpdates.Add((slice[k].ShopId, slice[k].ItemId, paths[ci]));
+                }
+                if (batchUpdates.Count > 0)
+                {
+                    _taskStore.SetShopProductCategories(batchUpdates); // ghi từng lô → không mất tiến độ nếu lỗi
+                    totalUpdated += batchUpdates.Count;
+                }
+            }
+
+            _taskStore.PruneUnusedCategories(); // dọn danh mục rác cũ không còn sản phẩm
+            RefreshCategoriesGrid();
+            RefreshFileCategoryCombo();
+            ReloadAllLaneProducts();
+            MessageBox.Show($"Đã cập nhật danh mục cho {totalUpdated}/{products.Count} sản phẩm.",
+                "Cập nhật danh mục (AI)", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        finally
+        {
+            _updatingCategories = false;
+            _updateCategoriesBtn.Enabled = true;
+            _fileUpdateCatBtn.Enabled = true;
+            _updateFileCategoriesBtn.Enabled = true;
+            _refreshCategoriesBtn.Enabled = true;
+            RefreshCategoriesGrid();
+        }
+    }
+
+    // Cập nhật danh mục cho 1 FILE EXCEL (không đụng CSDL): chọn file → AI phân loại theo tên sp →
+    // ghi danh mục vào cột "Danh mục" rồi lưu lại chính file đó. Dành cho file lớn (~chục nghìn dòng).
+    private async void OnUpdateFileCategoriesClick(object? sender, EventArgs e)
+    {
+        if (_updatingCategories) return;
+
+        if (!File.Exists(CategoryDocxPath))
+        {
+            MessageBox.Show($"Không thấy file danh mục tham chiếu:\n{CategoryDocxPath}", "Cập nhật danh mục cho file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (!File.Exists(OpenAiKeyPath))
+        {
+            MessageBox.Show($"Không thấy file OpenAI key:\n{OpenAiKeyPath}", "Cập nhật danh mục cho file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        List<ShopeeCategoryReference.LeafCategory> leaves;
+        string apiKey;
+        try
+        {
+            leaves = ShopeeCategoryReference.LoadLeafCategories(CategoryDocxPath);
+            apiKey = CategoryAiUpdater.ReadKey(OpenAiKeyPath);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Đọc danh mục/key lỗi: " + ex.Message, "Cập nhật danh mục cho file", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        if (leaves.Count == 0 || string.IsNullOrWhiteSpace(apiKey))
+        {
+            MessageBox.Show("Danh mục tham chiếu trống hoặc key rỗng.", "Cập nhật danh mục cho file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        string path;
+        using (var dlg = new OpenFileDialog { Title = "Chọn file Excel cần cập nhật danh mục", Filter = "Excel (*.xlsx)|*.xlsx" })
+        {
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            path = dlg.FileName;
+        }
+
+        // Bật báo "đang thực hiện" ngay từ lúc đọc file (file lớn có thể mất vài giây).
+        void StopBusy() { _categoriesSpinner.Spinning = false; _categoriesCountLabel.ForeColor = Color.Gray; }
+        _categoriesSpinner.Spinning = true;
+        _categoriesCountLabel.ForeColor = Color.FromArgb(40, 90, 150);
+        _categoriesCountLabel.Text = $"Đang đọc file: {Path.GetFileName(path)} …";
+
+        ExcelCategoryFile file;
+        try { file = await Task.Run(() => new ExcelCategoryFile(path)); }
+        catch (IOException)
+        {
+            StopBusy();
+            MessageBox.Show("Không mở được file (có thể đang mở trong Excel). Hãy đóng file rồi thử lại.", "Cập nhật danh mục cho file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        catch (Exception ex)
+        {
+            StopBusy();
+            MessageBox.Show("Đọc file Excel lỗi: " + ex.Message, "Cập nhật danh mục cho file", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        var total = file.Names.Count;
+        if (total == 0)
+        {
+            file.Dispose();
+            StopBusy();
+            _categoriesCountLabel.Text = "";
+            MessageBox.Show("Không tìm thấy dòng sản phẩm nào (cần cột 'Tên sp') trong file.", "Cập nhật danh mục cho file", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        _categoriesCountLabel.Text = $"File có {total} dòng — chờ xác nhận…";
+        if (MessageBox.Show(
+                $"Phân loại danh mục bằng AI cho {total} dòng trong file:\n{Path.GetFileName(path)}\n(model gpt-4.1-mini), rồi ghi lại chính file này. Tiếp tục?",
+                "Cập nhật danh mục cho file", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+        {
+            file.Dispose();
+            StopBusy();
+            _categoriesCountLabel.Text = "";
+            return;
+        }
+
+        _updatingCategories = true;
+        _updateCategoriesBtn.Enabled = false;
+        _fileUpdateCatBtn.Enabled = false;
+        _updateFileCategoriesBtn.Enabled = false;
+        _refreshCategoriesBtn.Enabled = false;
+        try
+        {
+            var paths = leaves.Select(l => l.Path).ToList();
+            var updater = new CategoryAiUpdater(apiKey, "gpt-4.1-mini");
+            var cats = await updater.ClassifyAllAsync(
+                file.Names, paths, batchSize: 50, maxParallel: 2,
+                onProgress: d => BeginInvoke(() => _categoriesCountLabel.Text = $"Đang phân loại (AI)… {d}/{total}"),
+                CancellationToken.None);
+
+            _categoriesCountLabel.Text = "Đang ghi lại file…";
+            var written = await Task.Run(() => file.ApplyAndSave(cats));
+            _categoriesCountLabel.Text = $"Đã ghi {written}/{total} dòng vào file.";
+
+            if (MessageBox.Show($"Đã cập nhật danh mục cho {written}/{total} dòng và lưu lại:\n{path}\n\nMở file?",
+                    "Cập nhật danh mục cho file", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Lỗi cập nhật danh mục cho file: " + ex.Message, "Cập nhật danh mục cho file", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            file.Dispose();
+            _updatingCategories = false;
+            _updateCategoriesBtn.Enabled = true;
+            _fileUpdateCatBtn.Enabled = true;
+            _updateFileCategoriesBtn.Enabled = true;
+            _refreshCategoriesBtn.Enabled = true;
+        }
+    }
+
+    // Nạp danh sách danh mục vào combo lọc của tab "Tìm theo file" (giữ lựa chọn hiện tại nếu còn).
+    private void RefreshFileCategoryCombo()
+    {
+        var prev = _fileCategoryCombo.SelectedItem as string;
+        List<SearchTaskStore.CategoryRow> rows;
+        try { rows = _taskStore.GetCategories(); }
+        catch { return; }
+
+        _fileCategoryCombo.BeginUpdate();
+        _fileCategoryCombo.Items.Clear();
+        _fileCategoryCombo.Items.Add(AllCategoriesItem);
+        foreach (var c in rows)
+            if (!string.IsNullOrWhiteSpace(c.Name))
+                _fileCategoryCombo.Items.Add(c.Name);
+        var idx = prev is null ? 0 : _fileCategoryCombo.Items.IndexOf(prev);
+        _fileCategoryCombo.SelectedIndex = idx >= 0 ? idx : 0;
+        _fileCategoryCombo.EndUpdate();
+    }
+
+    // ISO date string → "yyyy-MM-dd HH:mm" cho dễ đọc; giữ nguyên nếu parse lỗi.
+    private static string FormatDateString(string iso) =>
+        DateTime.TryParse(iso, out var dt) ? dt.ToString("yyyy-MM-dd HH:mm") : iso;
+
     private static Label MakeLabel(string text) =>
         // Anchor = Left (không Top/Bottom) để FlowLayoutPanel canh giữa label theo chiều cao hàng
         new() { Text = text, AutoSize = true, TextAlign = ContentAlignment.MiddleLeft, Anchor = AnchorStyles.Left };
@@ -644,7 +1110,7 @@ public sealed class MainForm : Form
         return (lbl, num);
     }
 
-    // â”€â”€ Wire-up â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Wire-up ───────────────────────────────────────────────────────────────
 
     protected override void OnLoad(EventArgs e)
     {
@@ -657,29 +1123,55 @@ public sealed class MainForm : Form
         _stopBtn.Click += OnStopClick;
         _exportBtn.Click += OnExportClick;
         _exportAllBtn.Click += OnExportAllKeywordsClick;
+        _clearKeywordSearchBtn.Click += OnClearKeywordSearchClick;
         _openTestBtn.Click += OnOpenShopeeTestClick;
 
         _chooseFileBtn.Click += OnChooseFileClick;
+        _clearFileListBtn.Click += OnClearFileListClick;
+        // Giữ số Process qua các lần chạy / mở lại app.
+        _fileProcessBox.ValueChanged += (_, _) =>
+        {
+            _appSettings.Settings.LastFileProcessCount = (int)_fileProcessBox.Value;
+            _appSettings.SaveSettings();
+        };
         _fileRunBtn.Click += OnRunFileClick;
         _fileStopBtn.Click += OnFileStopClick;
         _fileExportBtn.Click += OnFileExportClick;
         _fileExportAllBtn.Click += OnFileExportAllClick;
+        _refreshCategoriesBtn.Click += (_, _) => { RefreshCategoriesGrid(); RefreshFileCategoryCombo(); };
+        _updateCategoriesBtn.Click += OnUpdateCategoriesClick;
+        _fileUpdateCatBtn.Click += OnUpdateCategoriesClick;
+        _updateFileCategoriesBtn.Click += OnUpdateFileCategoriesClick;
+        _categoriesGrid.SelectionChanged += (_, _) => LoadCategoryProductsForSelected();
+        // Làm mới danh sách danh mục khi mở dropdown.
+        _fileCategoryCombo.DropDown += (_, _) => RefreshFileCategoryCombo();
+        // Nút "Áp dụng": lọc lại ngay kết quả đang hiển thị theo min giá/min bán/danh mục hiện tại.
+        _fileApplyFilterBtn.Click += (_, _) => { RefreshFileCategoryCombo(); ReloadAllLaneProducts(); };
         _fileRescanBtn.Click += OnFileRescanClick;
+        _clearFileSearchBtn.Click += OnClearFileSearchClick;
         _fileStopBtn.Enabled = false;
 
         _toolTip.SetToolTip(_startBtn, "Bắt đầu tìm kiếm");
         _toolTip.SetToolTip(_autoBtn, "Chạy tự động (tất cả từ khóa)");
-        _toolTip.SetToolTip(_resumeFailedBtn, "Resume task lỗi gần nhất (mở lại Brave)");
-        _toolTip.SetToolTip(_pauseBtn, "Tạm dừng script (không tắt Brave); bấm lại để tiếp tục");
-        _toolTip.SetToolTip(_stopBtn, "Dừng hẳn: tắt Brave và kết thúc phiên");
+        _toolTip.SetToolTip(_resumeFailedBtn, "Resume task lỗi gần nhất (mở lại Edge)");
+        _toolTip.SetToolTip(_pauseBtn, "Tạm dừng script (không tắt Edge); bấm lại để tiếp tục");
+        _toolTip.SetToolTip(_stopBtn, "Dừng hẳn: tắt Edge và kết thúc phiên");
         _toolTip.SetToolTip(_exportBtn, "Xuất Excel");
-        _toolTip.SetToolTip(_openTestBtn, "Mở Brave với profile tài khoản để test (không tìm kiếm)");
+        _toolTip.SetToolTip(_clearKeywordSearchBtn, "Xóa toàn bộ lịch sử task và kết quả tìm theo từ khóa");
+        _toolTip.SetToolTip(_clearFileSearchBtn, "Xóa toàn bộ lịch sử quét shop theo file");
+        _toolTip.SetToolTip(_openTestBtn, "Mở Edge với profile tài khoản để test (không tìm kiếm)");
 
         _importBtn.Click += OnImportClick;
         _addAccountBtn.Click += OnAddAccountClick;
         _editAccountBtn.Click += OnEditAccountClick;
         _deleteAccountBtn.Click += OnDeleteAccountClick;
+        _markErrorBtn.Click += OnMarkAccountErrorClick;
+        _recoverBtn.Click += OnRecoverAccountClick;
+        _solveCaptchaBtn.Click += OnSolveCaptchaClick;
+        _toolTip.SetToolTip(_solveCaptchaBtn, "Mở Edge với chính profile tài khoản lỗi để tự giải verify/captcha, xong bấm \"← Khôi phục\"");
         _accountsGrid.CellDoubleClick += (_, _) => OnEditAccountClick(null, EventArgs.Empty);
+        _errorAccountsGrid.CellDoubleClick += (_, _) => OnEditAccountClick(null, EventArgs.Empty);
+        _importKeywordBtn.Click += OnImportKeywordsClick;
         _addKeywordBtn.Click += OnAddKeywordClick;
         _editKeywordBtn.Click += OnEditKeywordClick;
         _deleteKeywordBtn.Click += OnDeleteKeywordClick;
@@ -694,7 +1186,7 @@ public sealed class MainForm : Form
         _grid.KeyDown += OnResultsGridKeyDown;
         _grid.CellMouseDown += OnResultsGridCellMouseDown;
 
-        StyleLaneTabs(_fileLaneTabs, StopFileLaneByTab); // "✕" trên tab file
+        StyleLaneTabs(_fileLaneTabs, StopFileLaneByTab, ReconnectFileLaneByTab); // "✕" + "⟳" trên tab file
 
         CheckForResumableRun();
     }
@@ -711,6 +1203,19 @@ public sealed class MainForm : Form
         if (MessageBox.Show($"Dừng tìm từ khóa \"{page.Text}\"? Sẽ để \"chưa kết thúc\".",
                 "Dừng lane", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         _coordinator.StopLane(lane.LaneId);
+    }
+
+    // "⟳" trên tab từ khóa: kết nối lại lane này (relaunch + tiếp tục từ checkpoint, cùng account).
+    private void ReconnectKeywordLaneByTab(int tabIndex)
+    {
+        if (_coordinator is null || _laneTabs is null) return;
+        if (tabIndex < 0 || tabIndex >= _laneTabs.TabPages.Count) return;
+        var page = _laneTabs.TabPages[tabIndex];
+        var lane = _laneUi.Values.FirstOrDefault(u => u.Page == page);
+        if (lane is null) return;
+        lane.Status.Text = "⟳ Đang kết nối lại...";
+        SetLaneTabDot(lane.LaneId, Color.Orange);
+        _coordinator.RestartLane(lane.LaneId);
     }
 
     // "✕" on a file tab. Đang chạy → dừng file đó (chưa kết thúc). Không chạy → đóng (gỡ) tab file đó.
@@ -743,6 +1248,20 @@ public sealed class MainForm : Form
         page.Dispose();
         UpdateFileBoxText();
         PersistFilePaths();
+    }
+
+    // "⟳" trên tab file: kết nối lại lane đang chạy file này (relaunch + thử lại link hiện tại, cùng account).
+    private void ReconnectFileLaneByTab(int tabIndex)
+    {
+        if (_fileCoordinator is null || tabIndex < 0 || tabIndex >= _fileLaneTabs.TabPages.Count) return;
+        var page = _fileLaneTabs.TabPages[tabIndex];
+        var lane = _fileLaneUis.FirstOrDefault(u => u.Page == page);
+        if (lane is null) return;
+        var laneId = _laneToFile.FirstOrDefault(kv =>
+            string.Equals(kv.Value, lane.FilePath, StringComparison.OrdinalIgnoreCase)).Key;
+        if (laneId <= 0) return; // file chưa chạy trên lane nào → không có gì để kết nối lại
+        lane.Status.Text = "⟳ Đang kết nối lại...";
+        _fileCoordinator.RestartLane(laneId);
     }
 
     // On startup: re-load last file selection (only files with pending links) and, if a previous run
@@ -812,7 +1331,7 @@ public sealed class MainForm : Form
             var outcome = await RunSearchSessionAsync(account, selectedKeyword, autoMode: false, ct);
             if (outcome != SearchRunOutcome.Completed)
             {
-                _brave.Kill();
+                _edge.Kill();
                 _ = DisposeCdpInputAsync();
                 _ws?.Dispose();
                 _ws = null;
@@ -833,7 +1352,8 @@ public sealed class MainForm : Form
 
     private async void OnAutoClick(object? sender, EventArgs e)
     {
-        var accounts = _appSettings.Settings.Instances.ToList();
+        // Pool = account KHÔNG ở tab "Lỗi", xoay vòng bắt đầu từ account sau account dùng lần trước.
+        var accounts = BuildRunAccounts();
         var allKeywords = _appSettings.Settings.Keywords
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Select(x => x.Trim())
@@ -841,7 +1361,8 @@ public sealed class MainForm : Form
 
         if (accounts.Count == 0)
         {
-            MessageBox.Show("Chưa có tài khoản để chạy tự động.", "Shopee Stat", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show("Không còn tài khoản khả dụng (tất cả đang ở tab \"Lỗi\"). Khôi phục bớt tài khoản rồi chạy lại.",
+                "Shopee Stat", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -880,7 +1401,7 @@ public sealed class MainForm : Form
 
         var coordinator = new AutoRunCoordinator(
             _appSettings, _taskStore, accounts, keywords, laneCount,
-            _locationBox.Text.Trim(), (long)_minPriceBox.Value, (int)_minSoldBox.Value);
+            _locationBox.Text.Trim());
         _coordinator = coordinator;
 
         coordinator.LaneStatus += (lane, msg) => BeginInvoke(() =>
@@ -910,6 +1431,8 @@ public sealed class MainForm : Form
         coordinator.LaneFinished += lane => BeginInvoke(() => OnLaneFinished(lane));
         coordinator.TasksChanged += () => BeginInvoke(RefreshTasksGrid);
         coordinator.AccountsChanged += () => BeginInvoke(RefreshAccountsGrid);
+        coordinator.AccountUsed += id => BeginInvoke(() => SetLastUsedAccount(id));
+        coordinator.AccountErrored += (id, reason) => BeginInvoke(() => MarkAccountErroredFromRun(id, reason));
         coordinator.SaveExcel = (keyword, results) => Task.Run(() => SaveKeywordExcel(keyword, results));
 
         try
@@ -944,7 +1467,7 @@ public sealed class MainForm : Form
         bool researchExistingTask = false,
         SearchConfig? presetConfig = null)
     {
-        // presetConfig != null → run with a caller-built config (e.g. shop-from-link mode),
+        // presetConfig != null ? run with a caller-built config (e.g. shop-from-link mode),
         // not the keyword tab's UI fields, and don't treat the label as a keyword.
         // (Keyword is marked "đã hoàn thành" only when the crawl Completes — see SearchCompleted below.)
         SetStatus("Đang khởi động...");
@@ -955,7 +1478,7 @@ public sealed class MainForm : Form
         string? proxy;
         try
         {
-            proxy = await _brave.ResolveProxyAsync(account);
+            proxy = await _edge.ResolveProxyAsync(account);
         }
         catch (Exception ex)
         {
@@ -965,15 +1488,15 @@ public sealed class MainForm : Form
             return SearchRunOutcome.Error;
         }
 
-        _brave.Launch(account, profileDir, proxy, port);
-        SetStatus("Brave đang khởi động...");
-        await _brave.CleanupRestoredTabsAsync(port, ct);
+        _edge.Launch(account, profileDir, proxy, port);
+        SetStatus("Edge đang khởi động...");
+        await _edge.CleanupRestoredTabsAsync(port, ct);
 
         if (account.OpenWithShopeeAccount)
         {
             SetStatus("Đang đăng nhập Shopee...");
             var loginSvc = new ShopeeLoginService(_appSettings);
-            var ok = await loginSvc.EnsureLoggedInAsync(account, _brave.CdpPort, SetStatus, ct);
+            var ok = await loginSvc.EnsureLoggedInAsync(account, _edge.CdpPort, SetStatus, ct);
 
             if (!ok)
             {
@@ -989,8 +1512,8 @@ public sealed class MainForm : Form
         {
             Keyword = selectedKeyword,
             RegionFilterText = _locationBox.Text.Trim(),
-            MinPriceVnd = (long)_minPriceBox.Value,
-            MinMonthlySold = (int)_minSoldBox.Value,
+            MinPriceVnd = 0,
+            MinMonthlySold = 0,
             CheckVariantStock = false,
             ResumeCategoryIndex = 1,
         };
@@ -1002,8 +1525,6 @@ public sealed class MainForm : Form
             {
                 searchConfig.Keyword = task.Keyword;
                 searchConfig.RegionFilterText = task.RegionFilterText;
-                searchConfig.MinPriceVnd = task.MinPriceVnd;
-                searchConfig.MinMonthlySold = task.MinMonthlySold;
                 searchConfig.CheckVariantStock = task.CheckVariantStock;
                 searchConfig.ResumeCategoryIndex = resumeExistingTask
                     ? Math.Max(1, task.ResumeCategoryIndex)
@@ -1120,11 +1641,11 @@ public sealed class MainForm : Form
         // session by this point. Failure is non-fatal — the extension falls back to
         // synthetic events when a gesture is nacked.
         _ = DisposeCdpInputAsync();
-        _cdpInput = new CdpInputController(_ws, _brave.CdpPort);
+        _cdpInput = new CdpInputController(_ws, _edge.CdpPort);
         _cdpInput.Log += msg => Invoke(() => SetStatus(msg));
         _ = _cdpInput.StartAsync(ct);
 
-        SetStatus("Brave đang chạy. Chờ extension kết nối...");
+        SetStatus("Edge đang chạy. Chờ extension kết nối...");
         var outcome = await completion.Task;
         if (outcome == SearchRunOutcome.Cancelled)
             throw new OperationCanceledException(ct);
@@ -1160,7 +1681,7 @@ public sealed class MainForm : Form
         }
     }
 
-    // ── Parallel lane UI ────────────────────────────────────────────────────────
+    // -- Parallel lane UI --------------------------------------------------------
 
     // Creates the "số luồng" selector and the (initially hidden) per-lane tab control,
     // sharing the grid cell with the single-run grid.
@@ -1177,7 +1698,7 @@ public sealed class MainForm : Form
                 Width = 55,
                 Value = Math.Clamp(_appSettings.Settings.MaxParallelLanes, 1, 10),
             };
-            _toolTip.SetToolTip(_lanesBox, "Số cửa sổ Brave/account chạy song song khi bấm Tự động (≤ số account).");
+            _toolTip.SetToolTip(_lanesBox, "Số cửa sổ Edge/account chạy song song khi bấm Tự động (= số account).");
             accountPanel.Controls.Add(_lanesBox);
         }
 
@@ -1185,16 +1706,17 @@ public sealed class MainForm : Form
         {
             var pos = cell.GetCellPosition(_grid);
             _laneTabs = new TabControl { Dock = DockStyle.Fill, Visible = false };
-            StyleLaneTabs(_laneTabs, StopKeywordLaneByTab);
+            StyleLaneTabs(_laneTabs, StopKeywordLaneByTab, ReconnectKeywordLaneByTab);
             cell.Controls.Add(_laneTabs, pos.Column, pos.Row);
         }
     }
 
     private const int LaneTabCloseW = 18; // bề rộng vùng "✕" bên phải mỗi tab lane
 
-    // Owner-draws a lane TabControl with large, high-contrast tabs + a "✕" per tab. Selected lane =
-    // solid accent fill + white bold text; others light grey. Clicking "✕" calls onCloseTab(index).
-    private void StyleLaneTabs(TabControl tabs, Action<int> onCloseTab)
+    // Owner-draws a lane TabControl with large, high-contrast tabs + "⟳" (kết nối lại) và "✕" per tab.
+    // Selected lane = solid accent fill + white bold text; others light grey.
+    // Clicking "✕" → onCloseTab(index); clicking "⟳" → onReconnectTab(index).
+    private void StyleLaneTabs(TabControl tabs, Action<int> onCloseTab, Action<int> onReconnectTab)
     {
         tabs.DrawMode = TabDrawMode.OwnerDrawFixed;
         tabs.SizeMode = TabSizeMode.Fixed;
@@ -1215,10 +1737,14 @@ public sealed class MainForm : Form
             using (var sep = new Pen(Color.FromArgb(208, 212, 218)))
                 e.Graphics.DrawRectangle(sep, rect.X, rect.Y, rect.Width - 1, rect.Height - 1);
 
-            // "✕" close hit-area on the far right (handled in MouseDown).
+            // "✕" close + "⟳" reconnect hit-areas on the far right (handled in MouseDown).
             var closeRect = new Rectangle(rect.Right - LaneTabCloseW, rect.Y, LaneTabCloseW, rect.Height);
             TextRenderer.DrawText(e.Graphics, "✕", fontClose, closeRect,
                 selected ? Color.White : Color.FromArgb(150, 70, 70),
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            var reconnectRect = new Rectangle(rect.Right - 2 * LaneTabCloseW, rect.Y, LaneTabCloseW, rect.Height);
+            TextRenderer.DrawText(e.Graphics, "⟳", fontClose, reconnectRect,
+                selected ? Color.White : Color.FromArgb(0, 110, 70),
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
             // The product count is encoded as a trailing "[N]" in the tab text. Draw it as a
@@ -1236,7 +1762,7 @@ public sealed class MainForm : Form
             var fg = selected ? Color.White : Color.FromArgb(55, 55, 55);
             var badgeColor = selected ? Color.White : Color.FromArgb(0, 120, 215);
             var content = Rectangle.Inflate(rect, -8, 0);
-            content = new Rectangle(content.X, content.Y, content.Width - LaneTabCloseW, content.Height); // chừa chỗ cho ✕
+            content = new Rectangle(content.X, content.Y, content.Width - 2 * LaneTabCloseW, content.Height); // chừa chỗ cho ⟳ và ✕
 
             if (badge.Length > 0)
             {
@@ -1273,6 +1799,8 @@ public sealed class MainForm : Form
                 var r = tc.GetTabRect(i);
                 var x = new Rectangle(r.Right - LaneTabCloseW, r.Y, LaneTabCloseW, r.Height);
                 if (x.Contains(e.Location)) { onCloseTab(i); return; }
+                var rc = new Rectangle(r.Right - 2 * LaneTabCloseW, r.Y, LaneTabCloseW, r.Height);
+                if (rc.Contains(e.Location)) { onReconnectTab(i); return; }
             }
         };
     }
@@ -1285,7 +1813,7 @@ public sealed class MainForm : Form
         // The "Đã lấy về N sản phẩm" count only makes sense for the single grid; in parallel mode
         // each lane tab shows its own count, so hide the (always-0) global label there.
         _resultCountLabel.Visible = !show;
-        // The global WS dot is only driven by the single-run flow → meaningless in parallel mode
+        // The global WS dot is only driven by the single-run flow - meaningless in parallel mode
         // (it would sit at "Chưa kết nối"). Each lane tab shows its own connection dot instead.
         _wsStatusLabel.Visible = !show;
     }
@@ -1322,7 +1850,7 @@ public sealed class MainForm : Form
             AutoSize = false,
             Height = 24,
             TextAlign = ContentAlignment.MiddleLeft,
-            Text = "Chờ...",
+        Text = "Chờ...",
             ForeColor = Color.FromArgb(40, 90, 150),
         };
         var grid = NewResultGrid();
@@ -1375,8 +1903,8 @@ public sealed class MainForm : Form
             lane.Status.Text = msg;
     }
 
-    // A lane picks up a keyword. firstAttempt=true → a NEW keyword → (re)create the tab fresh.
-    // Retry (firstAttempt=false, account swap on the SAME keyword) → reuse the tab, keep its rows.
+    // A lane picks up a keyword. firstAttempt=true = a NEW keyword -> (re)create the tab fresh.
+    // Retry (firstAttempt=false, account swap on the SAME keyword) -> reuse the tab, keep its rows.
     private void OnLaneAssigned(int laneId, string keyword, string accountName, bool isFirstAttempt)
     {
         var lane = GetOrCreateLaneTab(laneId);
@@ -1389,7 +1917,7 @@ public sealed class MainForm : Form
         lane.Status.Text = isFirstAttempt
             ? $"Đang tìm \"{keyword}\" — {accountName}"
             : $"Thử lại \"{keyword}\" — {accountName} (giữ {lane.Counter.Count} sp đã có)";
-        SetLaneTabDot(laneId, Color.Orange); // (re)launching this lane → chờ kết nối
+        SetLaneTabDot(laneId, Color.Orange); // (re)launching this lane -> chờ kết nối
     }
 
     private void OnLaneFinished(int laneId)
@@ -1475,7 +2003,7 @@ public sealed class MainForm : Form
         return $"Stat - {clean} - {DateTime.Now:yyyy-MM-dd_HHmmss}.xlsx";
     }
 
-    // Test-only: open Brave with the selected account's profile + proxy + extension,
+    // Test-only: open Edge with the selected account's profile + proxy + extension,
     // exactly like a real run's launch step, but start no WebSocket server and no search.
     private async void OnOpenShopeeTestClick(object? sender, EventArgs e)
     {
@@ -1487,21 +2015,105 @@ public sealed class MainForm : Form
 
         try
         {
-            SetStatus($"Mở Brave test với profile \"{account.DisplayName}\"...");
+            SetStatus($"Mở Edge test với profile \"{account.DisplayName}\"...");
             var port = _appSettings.Settings.WsPort;
             var profileDir = _appSettings.GetProfileDir(account);
-            var proxy = await _brave.ResolveProxyAsync(account);
-            _brave.Launch(account, profileDir, proxy, port);
-            SetStatus($"Đã mở Brave (profile \"{account.DisplayName}\"). Chỉ để test — không chạy tìm kiếm.");
+            var proxy = await _edge.ResolveProxyAsync(account);
+            _edge.Launch(account, profileDir, proxy, port);
+            SetStatus($"Đã mở Edge (profile \"{account.DisplayName}\"). Chỉ để test — không chạy tìm kiếm.");
         }
         catch (Exception ex)
         {
             SetStatus("Mở test lỗi: " + ex.Message);
-            MessageBox.Show(ex.Message, "Mở Brave test", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(ex.Message, "Mở Edge test", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
-    // â”€â”€ Tìm theo file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Tìm theo file
+
+    private void OnClearKeywordSearchClick(object? sender, EventArgs e)
+    {
+        if (IsKeywordSearchActive())
+        {
+            MessageBox.Show("Đang tìm kiếm dở trước khi xóa dữ liệu.", "Shopee Stat",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (MessageBox.Show(
+                "Xóa toàn bộ lịch sử tìm kiếm từ khóa?\n\n"
+                + "• Task và sản phẩm đã lưu (CSDL)\n"
+                + "• Trạng thái \"đã hoàn thành\" của từ khóa\n"
+                + "• Bảng kết quả và log trên tab này",
+                "Xác nhận", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+            return;
+
+        _taskStore.ClearKeywordSearchHistory();
+        _appSettings.Settings.UsedKeywords.Clear();
+        _appSettings.SaveSettings();
+
+        _grid.Rows.Clear();
+        _logBox.Clear();
+        _currentTaskId = 0;
+        _lastFailedTaskId = 0;
+        _activeKeywords.Clear();
+        ResetLaneTabs();
+        UpdateResultCountLabel();
+        _exportBtn.Enabled = false;
+        _resumeFailedBtn.Enabled = false;
+
+        RefreshTasksGrid();
+        RefreshKeywordsGrid();
+        RefreshKeywordCombo();
+        SetStatus("Đã xóa lịch sử tìm kiếm từ khóa.");
+    }
+
+    private void OnClearFileSearchClick(object? sender, EventArgs e)
+    {
+        if (_fileRunning)
+        {
+            MessageBox.Show("Đang chạy dở trước khi xóa dữ liệu.", "Tìm theo file",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (MessageBox.Show(
+                "Xóa toàn bộ lịch sử tìm kiếm theo file?\n\n"
+                + "• Sản phẩm shop đã quét (CSDL)\n"
+                + "• Danh sách shop đã quét (scanned-shops.tsv)\n"
+                + "• Task tìm theo link\n"
+                + "• Trạng thái link trên file Excel đang mở",
+                "Xác nhận", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+            return;
+
+        _taskStore.ClearFileSearchHistory();
+        new ScannedShopStore(ShopExportDir).ClearAll();
+        _fileShopStore = null;
+
+        foreach (var path in _filePaths)
+        {
+            try { new LinkFileStore(path).ClearAllStatuses(); }
+            catch { /* best effort */ }
+        }
+
+        foreach (var lane in _fileLaneUis)
+        {
+            lane.ProductsGrid.Rows.Clear();
+            lane.ShownShopId = 0;
+            foreach (DataGridViewRow row in lane.LinksGrid.Rows)
+            {
+                row.Cells["Status"].Value = "";
+                row.Cells["Shop"].Value = ShopTextFromLink(Convert.ToString(row.Cells["Link"].Value) ?? "");
+                row.DefaultCellStyle.ForeColor = Color.Black;
+            }
+        }
+
+        _fileLogBox.Clear();
+        RefreshTasksGrid();
+        SetFileStatus("Đã xóa lịch sử tìm kiếm theo file.");
+    }
+
+    private bool IsKeywordSearchActive() => _coordinator is not null || _stopBtn.Enabled;
 
     private void OnChooseFileClick(object? sender, EventArgs e)
     {
@@ -1528,6 +2140,32 @@ public sealed class MainForm : Form
         {
             MessageBox.Show("Không đọc được file: " + ex.Message, "Tìm theo file", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    // Xóa toàn bộ danh sách file đã chọn (ô File) và đóng các tab file tương ứng. KHÔNG đụng CSDL
+    // đã quét (đó là nút "Xóa dữ liệu tìm kiếm"). Không cho xóa khi đang chạy.
+    private void OnClearFileListClick(object? sender, EventArgs e)
+    {
+        if (_fileRunning)
+        {
+            MessageBox.Show("Đang chạy — dừng trước khi xóa danh sách file.", "Tìm theo file", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (_filePaths.Count == 0)
+        {
+            SetFileStatus("Danh sách file đang trống.");
+            return;
+        }
+        if (MessageBox.Show($"Xóa {_filePaths.Count} file khỏi danh sách và đóng các tab tương ứng?\n(Dữ liệu đã quét trong CSDL vẫn giữ.)",
+                "Xóa danh sách file", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        _filePaths.Clear();
+        _laneToFile.Clear();
+        UpdateFileBoxText();
+        BuildFileLaneTabs();   // _filePaths trống → xóa sạch tab file
+        PersistFilePaths();    // không tự nạp lại lần mở app sau
+        SetFileStatus("Đã xóa danh sách file.");
     }
 
     private void UpdateFileBoxText() =>
@@ -1558,7 +2196,7 @@ public sealed class MainForm : Form
                 kept.Add(path);
                 totalPending += pending;
             }
-            catch { /* file lỗi → bỏ qua */ }
+            catch { /* file lỗi -> bỏ qua */ }
         }
 
         if (!kept.SequenceEqual(_appSettings.Settings.LastFilePaths))
@@ -1595,7 +2233,7 @@ public sealed class MainForm : Form
                 AutoSize = false,
                 Height = 24,
                 TextAlign = ContentAlignment.MiddleLeft,
-                Text = "Chờ...",
+            Text = "Chờ...",
                 ForeColor = Color.FromArgb(40, 90, 150),
             };
 
@@ -1617,7 +2255,7 @@ public sealed class MainForm : Form
             page.Controls.Add(tlp);
             _fileLaneTabs.TabPages.Add(page);
 
-            // Double-click a link → export that shop.
+            // Double-click a link -> export that shop.
             linksGrid.CellDoubleClick += (_, _) => OnFileExportClick(null, EventArgs.Empty);
 
             var ui = new FileLaneUi { Page = page, LinksGrid = linksGrid, ProductsGrid = productsGrid, Status = status, FilePath = path };
@@ -1648,9 +2286,15 @@ public sealed class MainForm : Form
         grid.Rows.Clear();
         foreach (var r in rows)
         {
-            var idx = grid.Rows.Add(r.RowNumber, r.Link, r.Status);
+            var idx = grid.Rows.Add(r.RowNumber, r.Link, ShopTextFromLink(r.Link), r.Status);
             grid.Rows[idx].DefaultCellStyle.ForeColor = StatusColor(r.Status, r.IsDone);
         }
+    }
+
+    private static string ShopTextFromLink(string link)
+    {
+        var (shopId, _) = ParseProductIdsFromLink(link);
+        return shopId > 0 ? $"shop-{shopId}" : "";
     }
 
     private static Color StatusColor(string status, bool isDone)
@@ -1681,12 +2325,14 @@ public sealed class MainForm : Form
         return _fileLaneUis.FirstOrDefault(l => l.Page == tab);
     }
 
-    private void SetFileLaneLinkStatus(int laneId, int rowNumber, string status)
+    private void SetFileLaneLinkStatus(int laneId, int rowNumber, string status, string shopName = "")
     {
         if (FileLaneForLane(laneId) is not { } lane) return;
         foreach (DataGridViewRow row in lane.LinksGrid.Rows)
         {
             if (row.IsNewRow || Convert.ToInt64(row.Cells["Row"].Value) != rowNumber) continue;
+            if (!string.IsNullOrWhiteSpace(shopName))
+                row.Cells["Shop"].Value = shopName.Trim();
             row.Cells["Status"].Value = status;
             row.DefaultCellStyle.ForeColor = StatusColor(status, false);
             if (string.Equals(status, LinkFileStore.Processing, StringComparison.OrdinalIgnoreCase))
@@ -1712,8 +2358,44 @@ public sealed class MainForm : Form
         lane.ShownShopId = shopId;
         lane.ProductsGrid.Rows.Clear();
         if (shopId <= 0) return;
-        foreach (var p in _taskStore.GetShopProducts(shopId))
-            lane.ProductsGrid.Rows.Add(p.Link, p.Name, p.PriceVnd.ToString("N0"), p.MonthlySold.ToString());
+        foreach (var p in _taskStore.GetShopProducts(shopId).Where(PassesFileFilter))
+            lane.ProductsGrid.Rows.Add(p.Link, p.Name, p.Category, p.PriceVnd.ToString("N0"), p.MonthlySold.ToString());
+    }
+
+    // Nạp lại bảng sản phẩm của TẤT CẢ lane đang hiển thị theo filter hiện tại (nút "Áp dụng").
+    private void ReloadAllLaneProducts()
+    {
+        foreach (var lane in _fileLaneUis)
+        {
+            if (lane.ShownShopId <= 0) continue;
+            lane.ProductsGrid.Rows.Clear();
+            foreach (var p in _taskStore.GetShopProducts(lane.ShownShopId).Where(PassesFileFilter))
+                lane.ProductsGrid.Rows.Add(p.Link, p.Name, p.Category, p.PriceVnd.ToString("N0"), p.MonthlySold.ToString());
+        }
+    }
+
+    // Filter dùng cho HIỂN THỊ + XUẤT EXCEL (0 = không giới hạn). Crawl vẫn lưu CSDL toàn bộ.
+    // Giá: giữ item chưa parse được giá (price=0). Bán/tháng: khoảng [từ, đến], 0 = bỏ chặn đầu đó.
+    private bool PassesFileFilter(ProductResult p)
+    {
+        var minPrice = (long)_fileMinPriceBox.Value;
+        var soldFrom = (int)_fileMinSoldFromBox.Value;
+        var soldTo   = (int)_fileMinSoldToBox.Value;
+        if (minPrice > 0 && p.PriceVnd > 0 && p.PriceVnd < minPrice) return false;
+        if (soldFrom > 0 && p.MonthlySold < soldFrom) return false;
+        if (soldTo > 0 && p.MonthlySold > soldTo) return false;
+        // Danh mục: "(Tất cả danh mục)" = không lọc; ngược lại chỉ giữ đúng danh mục đang chọn.
+        var cat = SelectedFileCategory();
+        if (cat is not null && !string.Equals(p.Category?.Trim(), cat, StringComparison.OrdinalIgnoreCase))
+            return false;
+        return true;
+    }
+
+    /// <summary>Danh mục đang chọn ở tab "Tìm theo file", hoặc null nếu chọn "(Tất cả danh mục)".</summary>
+    private string? SelectedFileCategory()
+    {
+        var sel = _fileCategoryCombo.SelectedItem as string;
+        return string.IsNullOrEmpty(sel) || sel == AllCategoriesItem ? null : sel;
     }
 
     private void AddFileLaneProductRow(int laneId, ProductResult p)
@@ -1721,17 +2403,19 @@ public sealed class MainForm : Form
         if (FileLaneForLane(laneId) is not { } lane) return;
         // Chỉ ghi sp của shop ĐANG hiển thị (tránh trộn khi user click xem link khác lúc đang chạy).
         if (lane.ShownShopId != 0 && p.ShopId != lane.ShownShopId) return;
+        if (!PassesFileFilter(p)) return; // lọc hiển thị (CSDL vẫn lưu đủ)
         foreach (DataGridViewRow row in lane.ProductsGrid.Rows)
         {
             if (row.IsNewRow) continue;
             if (!string.Equals(Convert.ToString(row.Cells[0].Value), p.Link, StringComparison.OrdinalIgnoreCase))
                 continue;
             row.Cells[1].Value = p.Name;
-            row.Cells[2].Value = p.PriceVnd.ToString("N0");
-            row.Cells[3].Value = p.MonthlySold.ToString();
+            row.Cells[2].Value = p.Category;
+            row.Cells[3].Value = p.PriceVnd.ToString("N0");
+            row.Cells[4].Value = p.MonthlySold.ToString();
             return;
         }
-        lane.ProductsGrid.Rows.Add(p.Link, p.Name, p.PriceVnd.ToString("N0"), p.MonthlySold.ToString());
+        lane.ProductsGrid.Rows.Add(p.Link, p.Name, p.Category, p.PriceVnd.ToString("N0"), p.MonthlySold.ToString());
     }
 
     // A lane (worker) picks up a file: remember the mapping and refresh that file's tab.
@@ -1742,6 +2426,17 @@ public sealed class MainForm : Form
         lane.Page.Text = $"{Path.GetFileName(filePath)} · {accountName}";
         lane.Status.Text = $"Tài khoản \"{accountName}\" — {rows.Count(r => !r.IsDone)} link cần xử lý";
         LoadRowsIntoGrid(lane.LinksGrid, rows);
+    }
+
+    private void OnFileLaneFileFinished(int laneId, string filePath)
+    {
+        RefreshCategoriesGrid(); // danh mục được upsert dần khi quét — cập nhật tab "Danh mục"
+        RefreshFileCategoryCombo();
+        _laneToFile.Remove(laneId);
+        if (FileLaneByPath(filePath) is not { } lane) return;
+        _fileLaneUis.Remove(lane);
+        _fileLaneTabs.TabPages.Remove(lane.Page);
+        lane.Page.Dispose();
     }
 
     // Export the products of the selected link's shop (active file tab). Data comes from SQLite,
@@ -1769,10 +2464,18 @@ public sealed class MainForm : Form
             return;
         }
 
-        var products = _taskStore.GetShopProducts(shopId);
-        if (products.Count == 0)
+        var allProducts = _taskStore.GetShopProducts(shopId);
+        if (allProducts.Count == 0)
         {
             MessageBox.Show("Shop này chưa có dữ liệu đã quét trong CSDL. Hãy chạy quét link này trước.",
+                "Tìm theo file", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        // Lọc theo min bán (từ–đến) + min giá trước khi xuất (CSDL vẫn giữ toàn bộ).
+        var products = allProducts.Where(PassesFileFilter).ToList();
+        if (products.Count == 0)
+        {
+            MessageBox.Show($"Shop có {allProducts.Count} sản phẩm nhưng không có sản phẩm nào khớp filter (min bán từ–đến / min giá).",
                 "Tìm theo file", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -1809,6 +2512,15 @@ public sealed class MainForm : Form
         if (all.Count == 0)
         {
             MessageBox.Show("Chưa có sản phẩm nào (từ tìm theo file) trong CSDL để xuất.", "Xuất tất cả", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        // Lọc theo min bán (từ–đến) + min giá trước khi gộp xuất (CSDL vẫn giữ toàn bộ).
+        var totalBeforeFilter = all.Count;
+        all = all.Where(PassesFileFilter).ToList();
+        if (all.Count == 0)
+        {
+            MessageBox.Show($"Có {totalBeforeFilter} sản phẩm trong CSDL nhưng không sản phẩm nào khớp filter (min bán từ–đến / min giá).",
+                "Xuất tất cả", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -1881,6 +2593,7 @@ public sealed class MainForm : Form
         }
 
         row.Cells["Status"].Value = "";
+        row.Cells["Shop"].Value = ShopTextFromLink(link);
         row.DefaultCellStyle.ForeColor = Color.Black;
         SetFileStatus($"Đã đặt quét lại shop {shopId}. Bấm \"Chạy\" để quét lại (dữ liệu cũ sẽ được cập nhật).");
     }
@@ -1893,32 +2606,32 @@ public sealed class MainForm : Form
             return;
         }
 
-        var accounts = _appSettings.Settings.Instances.ToList();
+        var accounts = BuildRunAccounts();
         if (accounts.Count == 0)
         {
-            MessageBox.Show("Chưa có tài khoản để chạy.", "Tìm theo file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show("Không còn tài khoản khả dụng (tất cả đang ở tab \"Lỗi\"). Khôi phục bớt tài khoản rồi chạy lại.",
+                "Tìm theo file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
         PersistFilePaths(); // nhớ để mở app lần sau tự nạp lại + resume
-        // Rebuild tabs so every chosen file is visible, then run min(#file, #acc) lanes in parallel.
+        // Rebuild tabs so every chosen file is visible; active worker count comes from Process.
         BuildFileLaneTabs();
         _laneToFile.Clear();
-        var laneCount = Math.Min(_filePaths.Count, accounts.Count);
+        var requestedProcesses = (int)_fileProcessBox.Value;
+        var laneCount = Math.Min(Math.Min(requestedProcesses, accounts.Count), _filePaths.Count);
 
         _searchCts?.Cancel();
         _searchCts = new CancellationTokenSource();
         var ct = _searchCts.Token;
 
         SetFileUiRunning(true);
-        var minPrice = (long)_fileMinPriceBox.Value;
-        var minSold = (int)_fileMinSoldBox.Value;
         var shopStore = new ScannedShopStore(ShopExportDir);
         _fileShopStore = shopStore;
-        SetFileStatus($"Chạy song song: {laneCount} lane, {_filePaths.Count} file, {accounts.Count} account.");
+        SetFileStatus($"Chạy song song: {laneCount} process, {_filePaths.Count} file, {accounts.Count} account.");
 
         var coordinator = new FileRunCoordinator(
-            _appSettings, _taskStore, accounts, _filePaths.ToList(), laneCount, minPrice, minSold, shopStore);
+            _appSettings, _taskStore, accounts, _filePaths.ToList(), laneCount, shopStore);
         _fileCoordinator = coordinator;
 
         coordinator.LaneStatus += (lane, msg) => BeginInvoke(() =>
@@ -1929,11 +2642,14 @@ public sealed class MainForm : Form
         });
         coordinator.LaneAssignedFile += (lane, filePath, accountName, rows) =>
             BeginInvoke(() => OnFileLaneAssigned(lane, filePath, accountName, rows));
-        coordinator.LaneLinkStatus += (lane, rowNumber, status) =>
-            BeginInvoke(() => SetFileLaneLinkStatus(lane, rowNumber, status));
+        coordinator.LaneLinkStatus += (lane, rowNumber, status, shopName) =>
+            BeginInvoke(() => SetFileLaneLinkStatus(lane, rowNumber, status, shopName));
         coordinator.LaneProduct += (lane, product) => BeginInvoke(() => AddFileLaneProductRow(lane, product));
+        coordinator.LaneFileFinished += (lane, filePath) => BeginInvoke(() => OnFileLaneFileFinished(lane, filePath));
         coordinator.LaneFinished += lane => BeginInvoke(() => { if (FileLaneForLane(lane) is { } ui) ui.Status.Text = "✓ " + ui.Status.Text; });
         coordinator.AccountsChanged += () => BeginInvoke(RefreshAccountsGrid);
+        coordinator.AccountUsed += id => BeginInvoke(() => SetLastUsedAccount(id));
+        coordinator.AccountErrored += (id, reason) => BeginInvoke(() => MarkAccountErroredFromRun(id, reason));
         coordinator.SaveShopExcel = (fileKeyword, shopName, results) => Task.Run(() => SaveShopExcelFile(fileKeyword, shopName, results));
 
         try
@@ -1956,7 +2672,7 @@ public sealed class MainForm : Form
         }
     }
 
-    // Saves one shop's products as shop-<name>-<datetime>.xlsx into D:\shopee-stat. Thread-safe:
+    // Saves one shop's products as {keyword}-{shop}-{datetime}.xlsx into D:\shopee-stat\shops. Thread-safe:
     // several lanes may finish a shop at the same time, so guard the filename probe with _excelLock.
     // Tên: {keyword}-{shop}-{datetime}.xlsx — keyword = tên file nguồn (bỏ đuôi).
     private void SaveShopExcelFile(string fileKeyword, string shopName, IReadOnlyList<ProductResult> results)
@@ -2011,7 +2727,7 @@ public sealed class MainForm : Form
         _fileCoordinator?.KillAllBrowsers();
         SetFileUiRunning(false);      // _fileRunning=false ngay → có thể bấm ✕ đóng tab liền
         _fileSpinner.Spinning = true; // vẫn quay để báo "đang dừng", tắt khi teardown xong (finally)
-        SetFileStatus("⏳ Đang dừng… chờ tắt các tiến trình Brave (có thể mất vài giây). Có thể bấm ✕ để bỏ tab.");
+        SetFileStatus("⏳ Đang dừng… chờ tắt các tiến trình Edge (có thể mất vài giây). Có thể bấm ✕ để bỏ tab.");
     }
 
     private void SetFileUiRunning(bool isRunning)
@@ -2019,7 +2735,10 @@ public sealed class MainForm : Form
         _fileRunning = isRunning;
         _fileRunBtn.Enabled = !isRunning;
         _chooseFileBtn.Enabled = !isRunning;
+        _clearFileListBtn.Enabled = !isRunning;
         _fileRescanBtn.Enabled = !isRunning;
+        _clearFileSearchBtn.Enabled = !isRunning;
+        _fileProcessBox.Enabled = !isRunning;
         _fileStopBtn.Enabled = isRunning;
         _fileSpinner.Spinning = isRunning;
     }
@@ -2036,7 +2755,7 @@ public sealed class MainForm : Form
             _taskStore.UpdateStatus(_currentTaskId, "Stopped", "Người dùng dừng.");
             RefreshTasksGrid();
         }
-        _brave.Kill();
+        _edge.Kill();
         _ = DisposeCdpInputAsync();
         _ws?.Dispose();
         _ws = null;
@@ -2113,7 +2832,7 @@ public sealed class MainForm : Form
         }
     }
 
-    // â”€â”€ Account CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Account CRUD ──────────────────────────────────────────────────────────
 
     private async void OnResumeFailedClick(object? sender, EventArgs e)
     {
@@ -2215,8 +2934,6 @@ public sealed class MainForm : Form
 
         SelectKeywordInCombo(task.Keyword);
         _locationBox.Text = task.RegionFilterText;
-        _minPriceBox.Value = Math.Min(_minPriceBox.Maximum, Math.Max(_minPriceBox.Minimum, task.MinPriceVnd));
-        _minSoldBox.Value = Math.Min(_minSoldBox.Maximum, Math.Max(_minSoldBox.Minimum, task.MinMonthlySold));
 
         SetSearchUiRunning(true);
         try
@@ -2234,7 +2951,7 @@ public sealed class MainForm : Form
 
             if (outcome != SearchRunOutcome.Completed)
             {
-                _brave.Kill();
+                _edge.Kill();
                 _ = DisposeCdpInputAsync();
                 _ws?.Dispose();
                 _ws = null;
@@ -2318,11 +3035,9 @@ public sealed class MainForm : Form
 
     private void OnEditAccountClick(object? sender, EventArgs e)
     {
-        if (_accountsGrid.SelectedRows.Count == 0) return;
-        var idx = _accountsGrid.SelectedRows[0].Index;
-        if (idx < 0 || idx >= _appSettings.Settings.Instances.Count) return;
+        var grid = ActiveAccountsGrid();
+        if (grid.SelectedRows.Count == 0 || grid.SelectedRows[0].Tag is not InstanceConfig config) return;
 
-        var config = _appSettings.Settings.Instances[idx];
         using var form = new AccountEditForm(config);
         if (form.ShowDialog(this) != DialogResult.OK) return;
 
@@ -2335,21 +3050,237 @@ public sealed class MainForm : Form
 
     private void OnDeleteAccountClick(object? sender, EventArgs e)
     {
-        if (_accountsGrid.SelectedRows.Count == 0) return;
-        var idx = _accountsGrid.SelectedRows[0].Index;
-        if (idx < 0 || idx >= _appSettings.Settings.Instances.Count) return;
+        var selected = SelectedAccounts(ActiveAccountsGrid());
+        if (selected.Count == 0) return;
 
-        var name = _appSettings.Settings.Instances[idx].DisplayName;
-        if (MessageBox.Show($"Xóa tài khoản \"{name}\"?", "Xác nhận",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        var prompt = selected.Count == 1
+            ? $"Xóa tài khoản \"{selected[0].DisplayName}\"?"
+            : $"Xóa {selected.Count} tài khoản đã chọn?";
+        if (MessageBox.Show(prompt, "Xác nhận", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
 
-        _appSettings.Settings.Instances.RemoveAt(idx);
+        foreach (var acc in selected)
+            _appSettings.Settings.Instances.Remove(acc);
+
         _appSettings.SaveSettings();
         RefreshAccountCombo();
         RefreshAccountsGrid();
     }
 
-    // â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // "Đánh dấu lỗi →": chuyển account đang chọn (tab Bình thường) sang tab Lỗi để khỏi dùng tiếp.
+    private void OnMarkAccountErrorClick(object? sender, EventArgs e)
+    {
+        var selected = SelectedAccounts(_accountsGrid);
+        if (selected.Count == 0)
+        {
+            MessageBox.Show("Chọn tài khoản ở tab \"Bình thường\" để đánh dấu lỗi.",
+                "Shopee Stat", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        foreach (var acc in selected)
+        {
+            acc.IsError = true;
+            if (string.IsNullOrWhiteSpace(acc.ErrorReason)) acc.ErrorReason = "Đánh dấu thủ công";
+            acc.ErrorAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+        }
+        _appSettings.SaveSettings();
+        RefreshAccountCombo();
+        RefreshAccountsGrid();
+    }
+
+    // "← Khôi phục": đưa account đang chọn (tab Lỗi) về lại tab Bình thường để dùng tiếp.
+    private void OnRecoverAccountClick(object? sender, EventArgs e)
+    {
+        var selected = SelectedAccounts(_errorAccountsGrid);
+        if (selected.Count == 0)
+        {
+            MessageBox.Show("Chọn tài khoản ở tab \"Lỗi\" để khôi phục.",
+                "Shopee Stat", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        foreach (var acc in selected)
+        {
+            acc.IsError = false;
+            acc.ErrorReason = "";
+            acc.ErrorAt = "";
+        }
+        _appSettings.SaveSettings();
+        RefreshAccountCombo();
+        RefreshAccountsGrid();
+    }
+
+    // "Mở giải captcha": mở Edge với CHÍNH profile của tài khoản lỗi (đang chọn ở tab Lỗi) tới
+    // shopee.vn để user tự giải verify/captcha. Account lỗi đã bị loại khỏi pool nên không đụng các
+    // lane đang chạy. Giải xong → bấm "← Khôi phục" để đưa account về lại tab Bình thường.
+    private async void OnSolveCaptchaClick(object? sender, EventArgs e)
+    {
+        var selected = SelectedAccounts(_errorAccountsGrid);
+        if (selected.Count == 0)
+        {
+            MessageBox.Show("Chọn tài khoản ở tab \"Lỗi\" để mở giải captcha.",
+                "Shopee Stat", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (selected.Count > 1)
+        {
+            MessageBox.Show("Mỗi lần chỉ mở 1 tài khoản để giải captcha. Chọn 1 tài khoản.",
+                "Shopee Stat", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var account = selected[0];
+        try
+        {
+            SetStatus($"Mở Edge giải captcha cho \"{account.DisplayName}\"...");
+            var port = _appSettings.Settings.WsPort;
+            var profileDir = _appSettings.GetProfileDir(account);
+            var proxy = await _edge.ResolveProxyAsync(account);
+            _edge.Launch(account, profileDir, proxy, port);
+            SetStatus("Edge đang khởi động...");
+            await _edge.CleanupRestoredTabsAsync(port);
+
+            // Nếu profile chưa đăng nhập thì đăng nhập luôn để user check tài khoản ngay
+            // (EnsureLoggedInAsync tự kiểm tra "đã login chưa" → chỉ login khi chưa, không re-login).
+            // Login lỗi cũng không chặn: cứ để cửa sổ mở cho user tự xử lý.
+            try
+            {
+                SetStatus($"Đang kiểm tra/đăng nhập tài khoản \"{account.DisplayName}\"...");
+                var loginSvc = new ShopeeLoginService(_appSettings);
+                await loginSvc.EnsureLoggedInAsync(account, _edge.CdpPort, SetStatus);
+                RefreshAccountsGrid();
+            }
+            catch (Exception loginEx)
+            {
+                SetStatus("Đăng nhập tự động lỗi (vẫn mở Edge để giải tay): " + loginEx.Message);
+            }
+
+            SetStatus($"Đã mở Edge (profile \"{account.DisplayName}\"). Tự giải verify/captcha trên trang Shopee, xong bấm \"← Khôi phục\".");
+            MessageBox.Show(
+                $"Đã mở Edge với tài khoản \"{account.DisplayName}\".\n\n" +
+                "1. Tài khoản đã được đăng nhập sẵn (nếu chưa login) — kiểm tra tài khoản tại đây.\n" +
+                "2. Giải verify/captcha trên trang Shopee vừa mở.\n" +
+                "3. Khi xong, quay lại đây bấm \"← Khôi phục\" để dùng lại tài khoản này.",
+                "Giải captcha", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Mở giải captcha lỗi: " + ex.Message);
+            MessageBox.Show(ex.Message, "Mở giải captcha", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    /// <summary>Cập nhật con trỏ "account dùng sau cùng" (gọi từ coordinator, đã marshal về UI thread).</summary>
+    private void SetLastUsedAccount(string accountId)
+    {
+        if (string.IsNullOrEmpty(accountId)) return;
+        if (string.Equals(_appSettings.Settings.LastUsedAccountId, accountId, StringComparison.OrdinalIgnoreCase)) return;
+        _appSettings.Settings.LastUsedAccountId = accountId;
+        _appSettings.SaveSettings();
+    }
+
+    /// <summary>Coordinator báo account dính verify/captcha → chuyển sang tab Lỗi (đã marshal về UI thread).</summary>
+    private void MarkAccountErroredFromRun(string accountId, string reason)
+    {
+        var acc = _appSettings.Settings.Instances.FirstOrDefault(a =>
+            string.Equals(a.Id, accountId, StringComparison.OrdinalIgnoreCase));
+        if (acc is null || acc.IsError) return;
+        acc.IsError = true;
+        acc.ErrorReason = string.IsNullOrWhiteSpace(reason) ? "Verify/captcha" : reason;
+        acc.ErrorAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+        _appSettings.SaveSettings();
+        RefreshAccountCombo();
+        RefreshAccountsGrid();
+    }
+
+    /// <summary>
+    /// Account pool cho một lượt chạy song song: bỏ account đang ở tab "Lỗi", và xoay danh sách để
+    /// bắt đầu từ account NGAY SAU account dùng sau cùng (round-robin bền qua các lần dừng/chạy lại).
+    /// </summary>
+    private List<InstanceConfig> BuildRunAccounts()
+    {
+        var pool = _appSettings.Settings.Instances.Where(a => !a.IsError).ToList();
+        if (pool.Count <= 1) return pool;
+
+        var lastId = _appSettings.Settings.LastUsedAccountId;
+        if (string.IsNullOrEmpty(lastId)) return pool;
+
+        var idx = pool.FindIndex(a => string.Equals(a.Id, lastId, StringComparison.OrdinalIgnoreCase));
+        if (idx < 0) return pool; // account dùng lần trước đã bị xóa/đánh lỗi → giữ nguyên thứ tự
+
+        var start = (idx + 1) % pool.Count;
+        return pool.Skip(start).Concat(pool.Take(start)).ToList();
+    }
+
+    // ── Config ────────────────────────────────────────────────────────────────
+
+    private void OnImportKeywordsClick(object? sender, EventArgs e)
+    {
+        using var dlg = new OpenFileDialog
+        {
+            Title = "Import từ khóa từ file .txt",
+            Filter = "Text (*.txt)|*.txt|All files (*.*)|*.*",
+            Multiselect = false,
+        };
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        string text;
+        try
+        {
+            text = File.ReadAllText(dlg.FileName, Encoding.UTF8);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Không đọc được file: " + ex.Message, "Import từ khóa", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        var seenInFile = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var uniqueFromFile = new List<string>();
+        var dupInFile = 0;
+        foreach (var line in ParseKeywordLines(text))
+        {
+            if (!seenInFile.Add(line))
+            {
+                dupInFile++;
+                continue;
+            }
+            uniqueFromFile.Add(line);
+        }
+
+        if (uniqueFromFile.Count == 0)
+        {
+            MessageBox.Show("File không có từ khóa hợp lệ.", "Import từ khóa", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var existing = new HashSet<string>(_appSettings.Settings.Keywords, StringComparer.OrdinalIgnoreCase);
+        var added = 0;
+        var dupExisting = 0;
+        foreach (var keyword in uniqueFromFile)
+        {
+            if (!existing.Add(keyword))
+            {
+                dupExisting++;
+                continue;
+            }
+            _appSettings.Settings.Keywords.Add(keyword);
+            added++;
+        }
+
+        if (added == 0)
+        {
+            MessageBox.Show(
+                $"Không thêm từ khóa mới.\nTrùng trong file: {dupInFile}\nĐã có trong danh sách: {dupExisting}",
+                "Import từ khóa", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        _appSettings.SaveSettings();
+        RefreshKeywordCombo();
+        RefreshKeywordsGrid();
+        MessageBox.Show(
+            $"Đã thêm {added} từ khóa.\nBỏ qua trùng trong file: {dupInFile}\nBỏ qua đã có sẵn: {dupExisting}",
+            "Import từ khóa", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
 
     private void OnAddKeywordClick(object? sender, EventArgs e)
     {
@@ -2462,14 +3393,14 @@ public sealed class MainForm : Form
         return form.ShowDialog(this) == DialogResult.OK ? textBox.Text.Trim() : null;
     }
 
-    // â”€â”€ UI helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── UI helpers ────────────────────────────────────────────────────────────
 
     private void ShowCaptchaAlert()
     {
         _searchSpinner.Spinning = false;
-        SetStatus("⚠ CAPTCHA! Giải captcha trong Brave rồi nhấn OK để tiếp tục.");
+        SetStatus("⚠ CAPTCHA! Giải captcha trong Edge rồi nhấn OK để tiếp tục.");
         if (MessageBox.Show(
-            "Shopee yêu cầu xác minh captcha.\nGiải captcha trong cửa sổ Brave rồi nhấn OK.",
+            "Shopee yêu cầu xác minh captcha.\nGiải captcha trong cửa sổ Edge rồi nhấn OK.",
             "Captcha", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) == DialogResult.OK)
         {
             _searchSpinner.Spinning = true;
@@ -2502,6 +3433,7 @@ public sealed class MainForm : Form
         _startBtn.Enabled = !isRunning;
         _autoBtn.Enabled = !isRunning;
         _resumeFailedBtn.Enabled = !isRunning && _lastFailedTaskId > 0;
+        _clearKeywordSearchBtn.Enabled = !isRunning;
         _pauseBtn.Enabled = isRunning;
         _stopBtn.Enabled = isRunning;
         _searchSpinner.Spinning = isRunning;
@@ -2524,7 +3456,7 @@ public sealed class MainForm : Form
             _pauseBtn.Text = "▶ Tiếp tục";
             _searchSpinner.Spinning = false;
             _ = _orchestrator.PauseAsync();
-            SetStatus("Đã tạm dừng (Brave vẫn mở). Bấm Tiếp tục để chạy lại.");
+            SetStatus("Đã tạm dừng (Edge vẫn mở). Bấm Tiếp tục để chạy lại.");
         }
         else
         {
@@ -2708,7 +3640,8 @@ public sealed class MainForm : Form
     private void RefreshAccountCombo()
     {
         _accountCombo.Items.Clear();
-        foreach (var inst in _appSettings.Settings.Instances)
+        // Bỏ account đang ở tab "Lỗi" — khôi phục trước rồi mới chọn để chạy đơn.
+        foreach (var inst in _appSettings.Settings.Instances.Where(a => !a.IsError))
             _accountCombo.Items.Add(inst);
         _accountCombo.DisplayMember = "DisplayName";
         if (_accountCombo.Items.Count > 0)
@@ -2871,40 +3804,72 @@ public sealed class MainForm : Form
 
     private void RefreshAccountsGrid()
     {
+        if (_accountsGrid.IsDisposed || _errorAccountsGrid.IsDisposed) return;
+
         _accountsGrid.Rows.Clear();
+        _errorAccountsGrid.Rows.Clear();
         foreach (var inst in _appSettings.Settings.Instances)
         {
-            var status = inst.OpenWithShopeeAccount ? "⚠ Cần đăng nhập" : "✓ Sẵn sàng";
-            _accountsGrid.Rows.Add(inst.Username, inst.ProxySummary, status, inst.ProfileRelativePath);
+            if (inst.IsError)
+            {
+                var reason = string.IsNullOrWhiteSpace(inst.ErrorReason) ? "Verify/captcha" : inst.ErrorReason;
+                if (!string.IsNullOrWhiteSpace(inst.ErrorAt)) reason += $" — {inst.ErrorAt}";
+                var i = _errorAccountsGrid.Rows.Add(inst.Username, inst.ProxySummary, reason, inst.ProfileRelativePath);
+                _errorAccountsGrid.Rows[i].Tag = inst;
+                _errorAccountsGrid.Rows[i].Cells["Status"].Style.ForeColor = Color.Firebrick;
+            }
+            else
+            {
+                var status = inst.OpenWithShopeeAccount ? "⚠ Cần đăng nhập" : "✓ Sẵn sàng";
+                var i = _accountsGrid.Rows.Add(inst.Username, inst.ProxySummary, status, inst.ProfileRelativePath);
+                _accountsGrid.Rows[i].Tag = inst;
+                _accountsGrid.Rows[i].Cells["Status"].Style.ForeColor =
+                    status.StartsWith('⚠') ? Color.OrangeRed : Color.ForestGreen;
+            }
         }
 
-        // Color the status cells
-        foreach (DataGridViewRow row in _accountsGrid.Rows)
-        {
-            var cell = row.Cells["Status"];
-            var val = cell.Value?.ToString() ?? "";
-            cell.Style.ForeColor = val.StartsWith('⚠') ? Color.OrangeRed : Color.ForestGreen;
-        }
+        _accountInnerTabs.TabPages[0].Text = $"Bình thường ({_accountsGrid.Rows.Count})";
+        _accountInnerTabs.TabPages[1].Text = $"Lỗi ({_errorAccountsGrid.Rows.Count})";
     }
+
+    /// <summary>Grid của sub-tab đang xem (Bình thường / Lỗi).</summary>
+    private DataGridView ActiveAccountsGrid() =>
+        _accountInnerTabs.SelectedIndex == 1 ? _errorAccountsGrid : _accountsGrid;
+
+    /// <summary>Các account đang được chọn ở grid truyền vào (theo Tag, không theo index).</summary>
+    private static List<InstanceConfig> SelectedAccounts(DataGridView grid) =>
+        grid.SelectedRows.Cast<DataGridViewRow>()
+            .Select(r => r.Tag as InstanceConfig)
+            .Where(a => a is not null)
+            .Cast<InstanceConfig>()
+            .Distinct()
+            .ToList();
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
         _searchCts?.Cancel();
         _coordinator?.KillAllBrowsers();
         _fileCoordinator?.KillAllBrowsers();
-        _brave.Kill();
+        _edge.Kill();
         _ = DisposeCdpInputAsync();
         _ws?.Dispose();
     }
 
     // Fire-and-forget: unsubscribes from the WS and closes the CDP session.
-    // Best-effort — Brave is torn down independently, so a lingering socket is harmless.
+    // Best-effort — Edge is torn down independently, so a lingering socket is harmless.
     private Task DisposeCdpInputAsync()
     {
         var controller = _cdpInput;
         _cdpInput = null;
         return controller is null ? Task.CompletedTask : controller.DisposeAsync().AsTask();
     }
+
+    private static List<string> ParseKeywordLines(string text) =>
+        (text ?? "")
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(l => l.Trim())
+            .Where(l => !string.IsNullOrWhiteSpace(l))
+            .ToList();
 
     private static List<string> SplitImportLines(string text, bool shopee)
     {
@@ -2926,3 +3891,4 @@ public sealed class MainForm : Form
         return lines;
     }
 }
+

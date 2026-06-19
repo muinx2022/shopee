@@ -18,9 +18,9 @@ internal sealed class ManagerForm : Form
 
         Text = "Multi Brave Manager v31";
         StartPosition = FormStartPosition.CenterScreen;
-        Width = 1480;
-        Height = 1080;
-        MinimumSize = new Size(1180, 900);
+        Width = 1680;
+        Height = 1320;
+        MinimumSize = new Size(1500, 1180);
 
         _split = new SplitContainer
         {
@@ -72,7 +72,7 @@ internal sealed class ManagerForm : Form
             return;
 
         var panel1Min = 260;
-        var panel2Min = 520;
+        var panel2Min = 1120;
         if (_split.Width <= panel1Min + panel2Min + _split.SplitterWidth)
         {
             panel1Min = 120;
@@ -83,7 +83,7 @@ internal sealed class ManagerForm : Form
         _split.Panel2MinSize = panel2Min;
 
         var maxLeft = Math.Max(panel1Min, _split.Width - panel2Min - _split.SplitterWidth);
-        var left = Math.Clamp(320, panel1Min, maxLeft);
+        var left = Math.Clamp(300, panel1Min, maxLeft);
         try
         {
             if (Math.Abs(_split.SplitterDistance - left) > 2)

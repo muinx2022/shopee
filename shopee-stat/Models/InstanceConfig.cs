@@ -20,6 +20,18 @@ public sealed class InstanceConfig
     /// </summary>
     public bool OpenWithShopeeAccount { get; set; }
 
+    /// <summary>
+    /// Tài khoản bị Shopee chặn (verify traffic / captcha) trong lúc chạy → chuyển sang tab "Lỗi"
+    /// và KHÔNG được dùng ở các lượt chạy song song cho tới khi user "Khôi phục".
+    /// </summary>
+    public bool IsError { get; set; }
+
+    /// <summary>Lý do bị đánh dấu lỗi (vd "Verify/captcha") — hiển thị ở tab Lỗi.</summary>
+    public string ErrorReason { get; set; } = "";
+
+    /// <summary>Thời điểm bị đánh dấu lỗi (chuỗi "yyyy-MM-dd HH:mm:ss") — hiển thị ở tab Lỗi.</summary>
+    public string ErrorAt { get; set; } = "";
+
     [JsonIgnore]
     public string Username =>
         ShopeeAccountLogin.Contains('|')

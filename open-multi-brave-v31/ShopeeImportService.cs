@@ -28,11 +28,12 @@ internal static class ShopeeImportService
     public static void ApplyProxyImport(
         IReadOnlyList<InstanceEntry> targets,
         IReadOnlyList<string> proxyKeys,
-        Action<string> refreshListItem)
+        Action<string> refreshListItem,
+        int startIndex = 0)
     {
         for (var i = 0; i < targets.Count; i++)
         {
-            targets[i].Config.KiotProxyKey = proxyKeys[i % proxyKeys.Count].Trim();
+            targets[i].Config.KiotProxyKey = proxyKeys[(startIndex + i) % proxyKeys.Count].Trim();
             targets[i].Config.ManualProxy = "";
             targets[i].Session.ApplyConfig(targets[i].Config);
             refreshListItem(targets[i].Config.Id);

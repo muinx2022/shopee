@@ -6,16 +6,23 @@ namespace OpenMultiBraveLauncherV3;
 
 internal static class BraveProfileManager
 {
-    public static DirectoryInfo EnsureProfile(DirectoryInfo sourceUserData, InstanceConfig config, Action<string>? log = null)
+    /// <summary>
+    /// Thư mục profile của instance — LUÔN nằm trong persistent-data (bền) để GIỮ cookie login
+    /// Shopee qua các phiên app. Trước đây profile Shopee sống ở runtime-sessions (xoá mỗi
+    /// phiên) → mất login → mỗi lần mở phải tự đăng nhập lại → Shopee coi là thiết bị lạ và bắn captcha.
+    /// Dùng chung cho EnsureProfile + ResolveProfileRoot + "mở thư mục profile" để 3 nơi luôn khớp.
+    /// </summary>
+    public static DirectoryInfo GetProfileRootDirectory(InstanceConfig config)
     {
         config.EnsureProfileRelativePath();
-        // Profile bền (BigSeller login dùng chung per-account) sống trong persistent-data để KHÔNG bị
-        // xoá mỗi phiên; còn lại dùng runtime-sessions (ephemeral) như cũ cho profile Shopee.
-        var rootBase = config.UsePersistentSharedProfile
-            ? AppSession.ResolvePersistentDataPath()
-            : AppSession.RootDirectory;
-        var profileRoot = new DirectoryInfo(
+        var rootBase = AppSession.ResolvePersistentDataPath();
+        return new DirectoryInfo(
             Path.Combine(rootBase, config.ProfileRelativePath.Replace('/', Path.DirectorySeparatorChar)));
+    }
+
+    public static DirectoryInfo EnsureProfile(DirectoryInfo sourceUserData, InstanceConfig config, Action<string>? log = null)
+    {
+        var profileRoot = GetProfileRootDirectory(config);
         var targetDefault = new DirectoryInfo(Path.Combine(profileRoot.FullName, "Default"));
 
         var sourceDefault = new DirectoryInfo(Path.Combine(sourceUserData.FullName, "Default"));
@@ -63,7 +70,13 @@ internal static class BraveProfileManager
         MarkProfileCleanShutdown(profileRoot);
     }
 
-    public static string BuildBraveArguments(int cdpPort, string userDataDir, string? proxyServer, Action<string>? log = null, string? sourceUserData = null)
+    public static string BuildBraveArguments(
+        int cdpPort,
+        string userDataDir,
+        string? proxyServer,
+        Action<string>? log = null,
+        string? sourceUserData = null,
+        bool loadRunnerExtension = true)
     {
         var parts = new List<string>
         {
@@ -74,46 +87,41 @@ internal static class BraveProfileManager
             "--no-default-browser-check",
             "--hide-crash-restore-bubble",
             $"--remote-debugging-port={cdpPort}",
+
+            // GIỮ CỬA SỔ NỀN LUÔN HOẠT ĐỘNG. Khi chạy nhiều instance, mở/đưa cửa sổ instance khác lên
+            // trước làm các cửa sổ còn lại bị che (occluded)/chạy nền → Brave bóp timer + renderer +
+            // service worker → scrape "đứng hình" (đúng triệu chứng: kẹt lúc mở sang instance khác).
+            // Các cờ dưới tắt toàn bộ cơ chế tiết kiệm tài nguyên đó để mọi instance scrape song song ổn định.
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
         };
         if (!string.IsNullOrWhiteSpace(proxyServer))
+        {
             parts.Add($"--proxy-server={proxyServer}");
+        }
 
-        var runnerPath = RunnerExtensionPaths.ResolveLoadDirectory();
-        if (runnerPath is null)
-            log?.Invoke("Canh bao: khong tim thay thu muc extension day du (thieu background.js) - Shopee Data Runner co the khong load.");
+        string? runnerPath = null;
+        if (loadRunnerExtension)
+        {
+            runnerPath = RunnerExtensionPaths.ResolveLoadDirectory();
+            if (runnerPath is null)
+                log?.Invoke("Canh bao: khong tim thay thu muc extension day du (thieu background.js) - Shopee Data Runner co the khong load.");
+        }
 
-        var extPaths = CollectExtensionLoadPaths(runnerPath, sourceUserData);
+        var extPaths = CollectExtensionLoadPaths(runnerPath);
         if (extPaths.Count > 0)
             parts.Add($"--load-extension=\"{string.Join(",", extPaths)}\"");
 
         return string.Join(" ", parts);
     }
 
-    private static List<string> CollectExtensionLoadPaths(string? runnerPath, string? sourceUserData)
+    private static List<string> CollectExtensionLoadPaths(string? runnerPath)
     {
         var paths = new List<string>();
         if (runnerPath is not null)
             paths.Add(runnerPath);
-
-        if (!string.IsNullOrWhiteSpace(sourceUserData))
-        {
-            var sourceExtDir = Path.Combine(sourceUserData, "Default", "Extensions");
-            if (Directory.Exists(sourceExtDir))
-            {
-                foreach (var extIdDir in Directory.EnumerateDirectories(sourceExtDir))
-                {
-                    if (Path.GetFileName(extIdDir).Equals("Temp", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    var versionDir = Directory.EnumerateDirectories(extIdDir)
-                        .Where(d => File.Exists(Path.Combine(d, "manifest.json")))
-                        .OrderByDescending(d => d)
-                        .FirstOrDefault();
-                    if (versionDir is not null)
-                        paths.Add(versionDir);
-                }
-            }
-        }
-
         return paths;
     }
 

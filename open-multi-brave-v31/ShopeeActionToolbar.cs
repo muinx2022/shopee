@@ -67,7 +67,12 @@ internal sealed class ShopeeActionToolbar : TableLayoutPanel
         StartAutoButton = CreateTopActionButton("Ch\u1ea1y t\u1ef1 \u0111\u1ed9ng", UiButtonHelper.Run());
         StopAutoButton = CreateTopActionButton("D\u1eebng t\u1ef1 \u0111\u1ed9ng", UiButtonHelper.Stop());
         StopAllButton = CreateTopActionButton("D\u1eebng t\u1ea5t c\u1ea3", UiButtonHelper.Stop());
+        // Ch\u1ea1y l\u1ea1i c\u00e1c profile \u0111ang b\u1ecb l\u1ed7i (captcha/proxy) - ch\u1ec9 hi\u1ec7n khi c\u00f3 profile l\u1ed7i.
+        RunFailedButton = CreateTopActionButton("Ch\u1ea1y profile l\u1ed7i", UiButtonHelper.Run());
+        RunFailedButton.Width = 150;
+        RunFailedButton.Visible = false;
         actionRow.Controls.Add(RunSelectedButton);
+        actionRow.Controls.Add(RunFailedButton);
         actionRow.Controls.Add(StopAllButton);
         actionGroup.Controls.Add(actionRow);
 
@@ -151,6 +156,7 @@ internal sealed class ShopeeActionToolbar : TableLayoutPanel
     public Button StartAutoButton { get; }
     public Button StopAutoButton { get; }
     public Button RunSelectedButton { get; }
+    public Button RunFailedButton { get; }
     public Button StopAllButton { get; }
     public Button AutoSetRowButton { get; }
     public Label AutoShopSheetLabel { get; }

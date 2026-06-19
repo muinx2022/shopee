@@ -27,8 +27,6 @@ internal sealed class BraveInstanceSession : IDisposable
     private string _sourceUserData = "";
     private string _statusText = "Dừng";
     private string _proxySummary = "";
-    private DateTimeOffset? _lastBigSellerImportAt;
-    private string? _lastBigSellerAuthStamp;
     private string? _lastInterruptLogSignature;
 
     private CancellationTokenSource? _runnerLoopCts;
@@ -38,10 +36,26 @@ internal sealed class BraveInstanceSession : IDisposable
     private CancellationTokenSource? _swPinnerCts;
     private Task? _swPinnerTask;
 
+    // Watchdog: phát hiện runner "đang chạy nhưng đứng im" (SW chết giữa chừng / tab treo).
+    // Ngưỡng 8 phút > nghỉ tối đa giữa link (5 phút) nên không báo nhầm lúc nghỉ.
+    private int? _watchdogLastRow;
+    private DateTime _watchdogStaleSince = DateTime.UtcNow;
+    private bool _watchdogRecoveredThisStall;
+    private static readonly TimeSpan WatchdogStallTimeout = TimeSpan.FromMinutes(8);
+
+    // SW runner hay không lên ở vài vòng đầu khi mở profile mới — relaunch lại tới 4 lần (mỗi vòng đã
+    // nhanh hơn nhờ MaxPopupReopenBeforeRelaunch=2) để profile "lì" vẫn lên thay vì bị bỏ cuộc/đánh lỗi.
+    private const int MaxExtensionRelaunchRetries = 4;
+
     private readonly System.Windows.Forms.Timer _monitorTimer;
     private readonly System.Windows.Forms.Timer _progressTimer;
 
     private bool _runnerLoopRequested;
+    // Đang trong khe cancel→relaunch→resume runner (watchdog/proxy mở lại profile rồi chạy tiếp). Lúc này
+    // _runnerLoopActive/_runnerLoopRequested tạm = false nên scheduler tưởng profile rảnh → mở thêm profile
+    // = VƯỢT MAX. Cờ này giữ profile vẫn "đang làm việc" (IsRunnerLoopPending) suốt khe đó.
+    private volatile bool _runnerResuming;
+    private bool _extensionAutomationEnabled = true;
 
     public event Action? StatusChanged;
     public event Action<string>? LogLine;
@@ -53,7 +67,9 @@ internal sealed class BraveInstanceSession : IDisposable
     public bool IsRunning => _running;
     public bool IsBusy => _busy;
     public bool IsRunnerLoopActive => _runnerLoopActive;
-    public bool IsRunnerLoopPending => _runnerLoopActive || _runnerLoopRequested;
+    public bool IsRunnerLoopPending => _runnerLoopActive || _runnerLoopRequested || _runnerResuming;
+    /// <summary>Đang relaunch+resume runner (cancel→mở lại profile→chạy tiếp) — KHÔNG coi là kết thúc thật.</summary>
+    public bool IsRunnerResuming => _runnerResuming;
     public string StatusText => _statusText;
     public string ProxySummary => _proxySummary;
     public DirectoryInfo? ProfileRoot => _profileRoot;
@@ -65,11 +81,15 @@ internal sealed class BraveInstanceSession : IDisposable
         _cookieService = new CookieService(_cdpClient);
         _log = log;
         _monitorTimer = new System.Windows.Forms.Timer { Interval = 30_000 };
-        _monitorTimer.Tick += async (_, _) => await CheckProxyAndRestartIfNeededAsync();
+        _monitorTimer.Tick += async (_, _) =>
+        {
+            await CheckRunnerStallAndRecoverAsync();
+            await CheckProxyAndRestartIfNeededAsync();
+        };
         _progressTimer = new System.Windows.Forms.Timer { Interval = 20_000 };
         _progressTimer.Tick += (_, _) =>
         {
-            if (!_running)
+            if (!_running || !_extensionAutomationEnabled)
                 return;
             _ = SyncExtensionProgressAsync(silent: true);
         };
@@ -79,6 +99,9 @@ internal sealed class BraveInstanceSession : IDisposable
 
     public async Task<bool> SyncExtensionProgressAsync(bool silent = false, CancellationToken cancellationToken = default)
     {
+        if (!_extensionAutomationEnabled)
+            return false;
+
         if (_config is null)
             return false;
 
@@ -253,15 +276,8 @@ internal sealed class BraveInstanceSession : IDisposable
                 return false;
             }
 
-            try
-            {
-                _ = await GetBrowserWebSocketUrlAsync().ConfigureAwait(false);
+            if (await _cdpClient.WaitForReadyAsync(1, delayMs, cancellationToken).ConfigureAwait(false))
                 return true;
-            }
-            catch
-            {
-                await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
-            }
         }
 
         return false;
@@ -276,11 +292,7 @@ internal sealed class BraveInstanceSession : IDisposable
         if (_config is null)
             return null;
 
-        _config.EnsureProfileRelativePath();
-        var path = Path.Combine(
-            AppSession.RootDirectory,
-            _config.ProfileRelativePath.Replace('/', Path.DirectorySeparatorChar));
-        var root = new DirectoryInfo(path);
+        var root = BraveProfileManager.GetProfileRootDirectory(_config);
         if (!root.Exists)
             return null;
 
@@ -304,8 +316,18 @@ internal sealed class BraveInstanceSession : IDisposable
             return Task.CompletedTask;
         }
 
-        _runnerLoopCts?.Cancel();
-        _runnerLoopCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        // Huỷ vòng cũ (nếu còn) rồi tạo CTS mới. Mỗi vòng dùng token CỤC BỘ (loopToken) và TỰ
+        // Dispose CTS của mình ở finally — tránh: (a) rò CTS/đăng-ký-linked qua mỗi lần resume,
+        // (b) task cũ đọc nhầm token mới khi field bị thay (trước đây body đọc thẳng field CTS).
+        try { _runnerLoopCts?.Cancel(); } catch (ObjectDisposedException) { }
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _runnerLoopCts = cts;
+        var loopToken = cts.Token;
+
+        // Đặt ĐỒNG BỘ trước khi Task.Run để không có khe IsRunnerLoopPending=false (scheduler dựa vào đó
+        // để giữ trần Max). Khe này đóng luôn cả cờ resume sau khi đã bắt đầu chạy lại.
+        _runnerLoopRequested = true;
+        _runnerResuming = false;
 
         _runnerLoopTask = Task.Run(async () =>
         {
@@ -326,13 +348,13 @@ internal sealed class BraveInstanceSession : IDisposable
                 {
                     Log("Brave chưa chạy — đang khởi động…");
                     await StartAsync(braveExe, sourceUserData).ConfigureAwait(false);
-                    await Task.Delay(3000, _runnerLoopCts.Token).ConfigureAwait(false);
+                    await Task.Delay(3000, loopToken).ConfigureAwait(false);
                 }
 
                 var profileRoot = ResolveProfileRoot()
                     ?? throw new InvalidOperationException("Profile chưa sẵn sàng — Start instance này trước.");
 
-                if (!await EnsureShopeeLoggedInAsync(_runnerLoopCts.Token).ConfigureAwait(false))
+                if (!await EnsureShopeeLoggedInAsync(loopToken).ConfigureAwait(false))
                     throw new InvalidOperationException(
                         "Không đăng nhập được Shopee (captcha/OTP hoặc sai tài khoản) — bỏ qua instance này.");
 
@@ -342,70 +364,53 @@ internal sealed class BraveInstanceSession : IDisposable
 
                 var extensionRetryCount = 0;
                 for (var proxyAttempt = 0;
-                     proxyAttempt < 4 && !_runnerLoopCts.Token.IsCancellationRequested;
+                     proxyAttempt < 4 && !loopToken.IsCancellationRequested;
                      proxyAttempt++)
                 {
                     try
                     {
-                        await EnsureBigSellerCookiesReadyAsync().ConfigureAwait(false);
                         await LauncherRunnerLoop.RunAsync(
                             _cdpPort,
                             profileRoot,
                             _config,
                             Log,
                             () => ExtensionProgressSynced?.Invoke(),
-                            EnsureBigSellerCookiesReadyAsync,
                             preferSuggestedResume: proxyAttempt > 0 || preferSuggestedResume,
-                            _runnerLoopCts.Token).ConfigureAwait(false);
+                            loopToken,
+                            onBeforeExtensionReady: async () =>
+                            {
+                                StopSwPinner();
+                                await Task.Delay(400, loopToken).ConfigureAwait(false);
+                            },
+                            onAfterExtensionReady: () =>
+                            {
+                                StartSwPinner();
+                                return Task.CompletedTask;
+                            }).ConfigureAwait(false);
                     }
                     catch (Exception ex) when (
                         retryExtensionStart &&
-                        extensionRetryCount < 2 &&
+                        extensionRetryCount < MaxExtensionRelaunchRetries &&
                         IsExtensionConnectionError(ex.Message))
                     {
                         extensionRetryCount++;
-                        Log($"Extension/CDP không phản hồi — tự đóng/mở lại profile rồi thử chạy lại ({extensionRetryCount}/2)…");
+                        Log($"Extension/CDP không phản hồi — tự đóng/mở lại profile rồi thử chạy lại ({extensionRetryCount}/{MaxExtensionRelaunchRetries})…");
                         await RestartProfileForExtensionErrorAsync().ConfigureAwait(false);
-                        await Task.Delay(3500, _runnerLoopCts.Token).ConfigureAwait(false);
-                        await EnsureBigSellerCookiesReadyAsync().ConfigureAwait(false);
+                        await Task.Delay(3500, loopToken).ConfigureAwait(false);
                         profileRoot = ResolveProfileRoot()
                             ?? throw new InvalidOperationException("Profile chưa sẵn sàng sau khi mở lại.");
                         proxyAttempt--;
                         continue;
                     }
 
-                    if (_config is null || !IsProxyPausedDuringRun(_config) || proxyAttempt >= 3)
-                        break;
-
-                    Log("Lỗi proxy khi mở link — tự khởi động lại profile với proxy mới…");
-                    _restarting = true;
-                    try
-                    {
-                        await RestartProfileForProxyErrorAsync().ConfigureAwait(false);
-                        await Task.Delay(3000, _runnerLoopCts.Token).ConfigureAwait(false);
-                        await EnsureBigSellerCookiesReadyAsync().ConfigureAwait(false);
-                        Log("Chạy tiếp sau khi đổi proxy…");
-                    }
-                    catch (Exception restartEx)
-                    {
-                        if (_config is not null)
-                        {
-                            _config.RunnerRunning = false;
-                            _config.RunnerPhase = "error";
-                            _config.LastRunnerMessage = $"Không lấy được proxy mới: {restartEx.Message}";
-                        }
-                        Log($"Không restart được sau lỗi proxy: {restartEx.Message}");
-                        break;
-                    }
-                    finally
-                    {
-                        _restarting = false;
-                    }
+                    // Proxy lỗi khi scrape (hoặc captcha) → RunAsync return với phase="paused".
+                    // KHÔNG retry cùng instance nữa: kết thúc loop để RunnerLoopEnded kích hoạt
+                    // handoff sang instance khác (xem ShopeeWorkspaceControl.HandleCaptchaHandoffAsync,
+                    // nay nhận cả ca proxy). Hoàn tất bình thường (phase="finished") cũng break ở đây.
+                    break;
                 }
 
                 Log("Runner hoàn tất.");
-                await WriteBackBigSellerCookiesIfRotatedAsync().ConfigureAwait(false);
-
                 // Tự đóng profile sau khi chạy xong (nếu bật)
                 if (_config is not null &&
                     _config.AutoCloseProfileOnFinish &&
@@ -453,22 +458,27 @@ internal sealed class BraveInstanceSession : IDisposable
                     RunnerLoopEnded?.Invoke(_config.Id);
                     _runnerLoopRequested = false;
                 }
+                // Vòng này sở hữu CTS của chính nó: gỡ field (nếu vẫn trỏ tới nó) rồi Dispose.
+                // Dispose lặp lại (vd Dispose()/Stop của session) là vô hại; gỡ field trước khi Dispose
+                // để các lời gọi Cancel bên ngoài không chạm vào CTS đã giải phóng.
+                if (ReferenceEquals(_runnerLoopCts, cts)) _runnerLoopCts = null;
+                cts.Dispose();
             }
-        }, _runnerLoopCts.Token);
+        }, loopToken);
 
         return Task.CompletedTask;
     }
 
     public async Task StopRunnerAsync(CancellationToken cancellationToken = default)
     {
-        if (!_runnerLoopActive)
+        if (!_runnerLoopActive && !_runnerLoopRequested && _runnerLoopTask is null)
         {
             Log("Runner chưa chạy — không có gì để dừng.");
             return;
         }
 
         Log("Đang dừng runner…");
-        _runnerLoopCts?.Cancel();
+        try { _runnerLoopCts?.Cancel(); } catch (ObjectDisposedException) { }
 
         var profileRoot = ResolveProfileRoot();
         if (profileRoot is not null)
@@ -512,10 +522,23 @@ internal sealed class BraveInstanceSession : IDisposable
         ExtensionProgressSynced?.Invoke();
     }
 
-    public async Task StartAsync(string braveExe, string sourceUserData)
+    public async Task StopRunningWorkAsync(CancellationToken cancellationToken = default)
+    {
+        if (_runnerLoopActive || _runnerLoopRequested || _runnerLoopTask is { IsCompleted: false })
+            await StopRunnerAsync(cancellationToken).ConfigureAwait(false);
+
+        if (_running)
+            await StopAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task StartAsync(string braveExe, string sourceUserData) =>
+        StartProfileAsync(braveExe, sourceUserData, enableRunnerExtension: true);
+
+    private async Task StartProfileAsync(string braveExe, string sourceUserData, bool enableRunnerExtension)
     {
         if (_busy || _config is null) return;
         _busy = true;
+        _extensionAutomationEnabled = enableRunnerExtension;
         _braveExe = braveExe.Trim();
         _sourceUserData = sourceUserData.Trim();
         SetStatus("Đang khởi động…");
@@ -526,18 +549,17 @@ internal sealed class BraveInstanceSession : IDisposable
                 throw new FileNotFoundException("Không tìm thấy brave.exe.", _braveExe);
 
             var (proxyServer, proxyData) = await ResolveProxyForLaunchAsync().ConfigureAwait(false);
-
-            // Cold start dùng CHUNG lõi với mọi lần mở lại; chỉ khác: dựng profile từ source (ensureProfile)
-            // + sau đó bật timers/auto-import (việc riêng của lần khởi động đầu).
             await BringUpProfileAsync(
                 proxyServer,
                 proxyData is not null ? BuildFingerprint(proxyData) : proxyServer ?? "",
                 ensureProfile: true).ConfigureAwait(false);
 
             _monitorTimer.Start();
-            _progressTimer.Start();
-            await AutoImportBigSellerCookiesAsync().ConfigureAwait(false);
-            ScheduleDeferredSyncAfterStart();
+            if (enableRunnerExtension)
+            {
+                _progressTimer.Start();
+                ScheduleDeferredSyncAfterStart();
+            }
         }
         catch (Exception ex)
         {
@@ -554,25 +576,41 @@ internal sealed class BraveInstanceSession : IDisposable
 
     private void StartSwPinner()
     {
-        _swPinnerCts?.Cancel();
-        _swPinnerCts = new CancellationTokenSource();
-        var ct = _swPinnerCts.Token;
+        if (!_extensionAutomationEnabled)
+            return;
+
+        // Resolve extensionId TRƯỚC khi tạo CTS: nhánh "extensionId is null" thoát sớm sẽ không
+        // để lại một CTS chưa Dispose.
         var extensionId = _profileRoot is null
             ? RunnerExtensionPaths.TryGetLoadedExtensionId()
             : ExtensionRunnerAutomation.TryGetRunnerExtensionIdFromProfile(_profileRoot)
               ?? RunnerExtensionPaths.TryGetLoadedExtensionId();
         if (extensionId is null) return;
 
+        try { _swPinnerCts?.Cancel(); } catch (ObjectDisposedException) { }
+        var cts = new CancellationTokenSource();
+        _swPinnerCts = cts;
+        var ct = cts.Token;
+
         _swPinnerTask = Task.Run(async () =>
         {
-            await ExtensionRunnerAutomation.PinSwWithFlatSessionAsync(
-                _cdpPort, extensionId, Log, ct).ConfigureAwait(false);
+            try
+            {
+                await ExtensionRunnerAutomation.PinSwWithFlatSessionAsync(
+                    _cdpPort, extensionId, Log, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                // Task sở hữu CTS của chính nó (xem ghi chú ở runner-loop): gỡ field rồi Dispose.
+                if (ReferenceEquals(_swPinnerCts, cts)) _swPinnerCts = null;
+                cts.Dispose();
+            }
         }, ct);
     }
 
     private void StopSwPinner()
     {
-        _swPinnerCts?.Cancel();
+        try { _swPinnerCts?.Cancel(); } catch (ObjectDisposedException) { }
         _swPinnerCts = null;
     }
 
@@ -581,6 +619,9 @@ internal sealed class BraveInstanceSession : IDisposable
     /// <summary>Xóa script cache của service worker để Brave load lại extension mới nhất từ disk.</summary>
     private void ScheduleDeferredSyncAfterStart()
     {
+        if (!_extensionAutomationEnabled)
+            return;
+
         _ = Task.Run(async () =>
         {
             await Task.Delay(2500).ConfigureAwait(false);
@@ -591,7 +632,7 @@ internal sealed class BraveInstanceSession : IDisposable
     /// <summary>Đóng nhanh (khi thoát app) - không chờ CDP.</summary>
     public void Stop()
     {
-        _runnerLoopCts?.Cancel();
+        try { _runnerLoopCts?.Cancel(); } catch (ObjectDisposedException) { }
         StopSwPinner();
         _monitorTimer.Stop();
         _progressTimer.Stop();
@@ -667,8 +708,22 @@ internal sealed class BraveInstanceSession : IDisposable
 
     public void Dispose()
     {
+        // Trước đây chỉ dừng+huỷ _monitorTimer → mỗi session đóng lại rò _progressTimer và hai
+        // CancellationTokenSource (linked CTS còn giữ đăng ký trên token cha) → tích luỹ qua nhiều
+        // lần mở/đóng profile → góp phần đơ máy. Dọn hết ở đây.
         _monitorTimer.Stop();
+        _progressTimer.Stop();
         _monitorTimer.Dispose();
+        _progressTimer.Dispose();
+
+        try { _runnerLoopCts?.Cancel(); } catch { }
+        try { _runnerLoopCts?.Dispose(); } catch { }
+        _runnerLoopCts = null;
+
+        try { _swPinnerCts?.Cancel(); } catch { }
+        try { _swPinnerCts?.Dispose(); } catch { }
+        _swPinnerCts = null;
+
         KillBraveProcess();
     }
 
@@ -708,26 +763,38 @@ internal sealed class BraveInstanceSession : IDisposable
 
     private void KillBraveProcess(int maxWaitMs = 1500)
     {
-        if (_braveProcess is null) return;
-        try
+        // Giết tiến trình stub mà launcher giữ tham chiếu (nếu còn).
+        if (_braveProcess is not null)
         {
-            if (!_braveProcess.HasExited)
+            try
             {
-                TryCloseBraveGracefully(maxWaitMs);
                 if (!_braveProcess.HasExited)
                 {
-                    _braveProcess.Kill(entireProcessTree: true);
-                    if (maxWaitMs > 0)
-                        _braveProcess.WaitForExit(maxWaitMs);
+                    TryCloseBraveGracefully(maxWaitMs);
+                    if (!_braveProcess.HasExited)
+                    {
+                        _braveProcess.Kill(entireProcessTree: true);
+                        if (maxWaitMs > 0)
+                            _braveProcess.WaitForExit(maxWaitMs);
+                    }
                 }
             }
+            catch { }
+            finally
+            {
+                _braveProcess.Dispose();
+                _braveProcess = null;
+            }
+        }
+
+        // Brave hay fork rồi thoát stub → browser thật + GPU/renderer/utility chạy ở PID khác,
+        // Kill(tree) ở trên bỏ sót. Quét & giết tận gốc theo --user-data-dir duy nhất của profile
+        // để không tích tụ zombie qua mỗi vòng xoay (nguyên nhân đơ máy sau vài vòng).
+        try
+        {
+            BraveProcessReaper.KillByUserDataDir(_profileRoot?.FullName, Log);
         }
         catch { }
-        finally
-        {
-            _braveProcess.Dispose();
-            _braveProcess = null;
-        }
     }
 
     private void TryCloseBraveGracefully(int maxWaitMs)
@@ -762,7 +829,9 @@ internal sealed class BraveInstanceSession : IDisposable
     }
 
     private string BuildBraveArguments(string userDataDir, string? proxyServer) =>
-        BraveProfileManager.BuildBraveArguments(_cdpPort, userDataDir, proxyServer, Log, _sourceUserData);
+        BraveProfileManager.BuildBraveArguments(
+            _cdpPort, userDataDir, proxyServer, Log, _sourceUserData,
+            loadRunnerExtension: _extensionAutomationEnabled);
 
     /// <summary>
     /// Kill tiến trình Brave đang theo dõi, RỒI đảm bảo CDP port đã nhả hẳn trước khi cho launch lại.
@@ -871,18 +940,108 @@ internal sealed class BraveInstanceSession : IDisposable
         return scheme + s;
     }
 
-    private static bool IsProxyPausedDuringRun(InstanceConfig config) =>
-        string.Equals(config.RunnerPhase, "paused", StringComparison.OrdinalIgnoreCase) &&
-        (config.LastRunnerMessage?.Contains("proxy", StringComparison.OrdinalIgnoreCase) == true ||
-         config.LastRunnerMessage?.Contains("không tải được trang", StringComparison.OrdinalIgnoreCase) == true);
-
     private static bool IsExtensionConnectionError(string message) =>
         message.Contains("extension", StringComparison.OrdinalIgnoreCase) &&
         (message.Contains("CDP", StringComparison.OrdinalIgnoreCase) ||
          message.Contains("không kết nối", StringComparison.OrdinalIgnoreCase) ||
-         message.Contains("không kết nối", StringComparison.OrdinalIgnoreCase) ||
-         message.Contains("không phản hồi", StringComparison.OrdinalIgnoreCase) ||
          message.Contains("không phản hồi", StringComparison.OrdinalIgnoreCase));
+
+    private async Task RestartProfileForProxyErrorAndResumeRunnerAsync()
+    {
+        var wasRunnerActive = _runnerLoopActive;
+        // Giữ profile được tính là "đang làm việc" suốt khe cancel→relaunch→resume để scheduler không mở
+        // thêm profile (vượt Max). ResumeContinueAsync gỡ cờ khi runner chạy lại; finally lo ca không resume.
+        if (wasRunnerActive) _runnerResuming = true;
+        try
+        {
+            try { _runnerLoopCts?.Cancel(); } catch { }
+            await RestartProfileForProxyErrorAsync().ConfigureAwait(false);
+            if (wasRunnerActive)
+            {
+                await Task.Delay(2500).ConfigureAwait(false);
+                await ResumeContinueAsync(_braveExe, _sourceUserData, preferSuggestedResume: true)
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            _runnerResuming = false;
+        }
+    }
+
+    private async Task RelaunchProfileAndResumeRunnerAsync(string? server, string? proxyFingerprint)
+    {
+        var wasRunnerActive = _runnerLoopActive;
+        if (wasRunnerActive) _runnerResuming = true;
+        try
+        {
+            try { _runnerLoopCts?.Cancel(); } catch { }
+            await RelaunchProfileAsync(server, proxyFingerprint).ConfigureAwait(false);
+            if (wasRunnerActive)
+            {
+                await Task.Delay(2500).ConfigureAwait(false);
+                await ResumeContinueAsync(_braveExe, _sourceUserData, preferSuggestedResume: true)
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            _runnerResuming = false;
+        }
+    }
+
+    /// <summary>
+    /// Watchdog: runner báo "đang chạy" nhưng dòng (CurrentRow) không tiến quá lâu = kẹt thật
+    /// (SW chết giữa chừng / tab treo / CDP đơ). Tự mở lại profile + chạy tiếp. Ngưỡng 8 phút >
+    /// nghỉ tối đa giữa link (5 phút) nên không đụng vào lúc runner nghỉ hợp lệ.
+    /// </summary>
+    private async Task CheckRunnerStallAndRecoverAsync()
+    {
+        // Chỉ canh khi runner thực sự đang chạy ở pha "đang làm việc". Mọi pha khác (paused/error/
+        // stopped/finished) hoặc đang restart/busy → reset bộ đếm.
+        var phase = _config?.RunnerPhase ?? "";
+        var working = _runnerLoopActive && !_restarting && !_busy && _config is not null &&
+            (phase.Equals("starting", StringComparison.OrdinalIgnoreCase) ||
+             phase.Equals("opening", StringComparison.OrdinalIgnoreCase) ||
+             phase.Equals("video", StringComparison.OrdinalIgnoreCase) ||
+             phase.Equals("running", StringComparison.OrdinalIgnoreCase));
+
+        if (!working)
+        {
+            _watchdogLastRow = _config?.CurrentRow;
+            _watchdogStaleSince = DateTime.UtcNow;
+            _watchdogRecoveredThisStall = false;
+            return;
+        }
+
+        if (_config!.CurrentRow != _watchdogLastRow)
+        {
+            _watchdogLastRow = _config.CurrentRow;
+            _watchdogStaleSince = DateTime.UtcNow;
+            _watchdogRecoveredThisStall = false;
+            return;
+        }
+
+        if (_watchdogRecoveredThisStall ||
+            DateTime.UtcNow - _watchdogStaleSince < WatchdogStallTimeout)
+            return;
+
+        _watchdogRecoveredThisStall = true;
+        _restarting = true;
+        Log($"Watchdog: runner kẹt ở dòng {_config.CurrentRow?.ToString() ?? "?"} > {WatchdogStallTimeout.TotalMinutes:0} phút — tự mở lại profile và chạy tiếp…");
+        try
+        {
+            await RestartProfileForProxyErrorAndResumeRunnerAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log($"Watchdog mở lại lỗi: {ex.Message}");
+        }
+        finally
+        {
+            _restarting = false;
+        }
+    }
 
     /// <summary>
     /// ĐƯỜNG THỰC THI DUY NHẤT để dựng Brave lên cho profile này — dùng cho CẢ khởi động lần đầu
@@ -913,7 +1072,6 @@ internal sealed class BraveInstanceSession : IDisposable
 
         StopSwPinner();
         ExtensionRunnerAutomation.ClearResolvedExtension(_cdpPort);
-        _lastBigSellerImportAt = null;
         PrepareProfileForLaunch(_profileRoot.FullName);
         await KillBraveAndWaitPortFreeAsync().ConfigureAwait(false);
 
@@ -924,7 +1082,9 @@ internal sealed class BraveInstanceSession : IDisposable
         if (proxyFingerprint is not null)
             _currentProxyFingerprint = proxyFingerprint;
         SetStatus(proxyServer is not null ? $"Đang chạy — {proxyServer}" : "Đang chạy — không proxy");
-        StartSwPinner();
+        // Không pin SW ở đây — runner loop StartSwPinner sau khi extension sẵn sàng.
+        if (_extensionAutomationEnabled)
+            await WaitForCdpReadyAsync(attempts: 40, delayMs: 500).ConfigureAwait(false);
     }
 
     /// <summary>Mở lại profile đang sống (warm restart) — wrapper gọn cho <see cref="BringUpProfileAsync"/>.</summary>
@@ -1057,19 +1217,14 @@ internal sealed class BraveInstanceSession : IDisposable
                     ? null
                     : NormalizeManualProxy(_config.ManualProxy, _config.ProxyType);
 
-                if (await HasChromeProxyErrorPageAsync().ConfigureAwait(false))
+                // Khi runner đang chạy: KHÔNG để monitor mở lại profile vì proxy thủ công cố định —
+                // mở lại cũng dính cùng proxy chết → kẹt "đang mở link X/Y → reload" lặp vô hạn.
+                // Để runner tự phát hiện proxyError ở bước scrape rồi tạm dừng (handoff) — sạch hơn.
+                if (await HasChromeProxyErrorPageAsync().ConfigureAwait(false) && !_runnerLoopActive)
                 {
                     _restarting = true;
                     Log("Phát hiện ERR_PROXY/No internet - tự khởi động lại profile...");
-                    var wasRunnerActive = _runnerLoopActive;
-                    try { _runnerLoopCts?.Cancel(); } catch { }
-                    await RestartProfileForProxyErrorAsync().ConfigureAwait(false);
-                    if (wasRunnerActive)
-                    {
-                        await Task.Delay(2500).ConfigureAwait(false);
-                        await ResumeContinueAsync(_braveExe, _sourceUserData, preferSuggestedResume: true)
-                            .ConfigureAwait(false);
-                    }
+                    await RestartProfileForProxyErrorAndResumeRunnerAsync().ConfigureAwait(false);
                 }
                 return;
             }
@@ -1098,15 +1253,18 @@ internal sealed class BraveInstanceSession : IDisposable
 
             if (!string.Equals(fp, _currentProxyFingerprint, StringComparison.Ordinal))
             {
-                _restarting = true;
-                Log($"Proxy đổi → khởi động lại");
-                await RelaunchProfileAsync(server, fp).ConfigureAwait(false);
-                return;
+                // KiotProxy (random) xoay proxy là BÌNH THƯỜNG — KHÔNG relaunch profile đang scrape ngon
+                // chỉ vì fingerprint đổi (gây "được tí lại reload" liên tục mỗi 30s). Chỉ cập nhật fp.
+                // Nếu proxy cũ thật sự chết: Brave hiện ERR_PROXY (xử lý ngay dưới) hoặc scrape step báo
+                // proxy error → handoff. Như vậy vẫn không "chết" khi đổi proxy mà không reload vô cớ.
+                _currentProxyFingerprint = fp;
             }
 
             // Proxy API báo OK nhung Brave v?n hi?n "No internet"/ERR_PROXY... (tab chrome-error).
             // Trường hợp này user đang phải Đóng profile → Mở lại thủ công. Tự động làm tương tự.
-            if (await HasChromeProxyErrorPageAsync().ConfigureAwait(false))
+            // Runner đang chạy → để bước scrape tự bắt proxyError và handoff sang profile khác (proxy mới).
+            // Monitor mở lại ở đây sẽ huỷ scrape đang chạy + dùng lại proxy cũ → vòng reload cùng một dòng.
+            if (await HasChromeProxyErrorPageAsync().ConfigureAwait(false) && !_runnerLoopActive)
             {
                 _restarting = true;
                 taskRunDispatched = true;
@@ -1116,18 +1274,8 @@ internal sealed class BraveInstanceSession : IDisposable
                     try
                     {
                         Log("Phát hiện ERR_PROXY/No internet trên tab - tự khởi động lại profile...");
-                        var wasRunnerActive = _runnerLoopActive;
-                        try { _runnerLoopCts?.Cancel(); } catch { }
-
-                        // Proxy không đổi (API báo OK) → giữ fingerprint, chỉ mở lại profile sạch.
-                        await RelaunchProfileAsync(restartServer, proxyFingerprint: null).ConfigureAwait(false);
-
-                        if (wasRunnerActive)
-                        {
-                            await Task.Delay(2500).ConfigureAwait(false);
-                            await ResumeContinueAsync(_braveExe, _sourceUserData, preferSuggestedResume: true)
-                                .ConfigureAwait(false);
-                        }
+                        await RelaunchProfileAndResumeRunnerAsync(restartServer, proxyFingerprint: null)
+                            .ConfigureAwait(false);
                     }
                     catch (Exception ex)
                     {
@@ -1223,23 +1371,8 @@ internal sealed class BraveInstanceSession : IDisposable
     {
         var cookies = await GetAllCookiesFromBraveAsync();
         Directory.CreateDirectory(Path.GetDirectoryName(fileName) ?? AppSession.RootDirectory);
-        var payload = new { exportedAt = DateTimeOffset.Now, cookies };
-        var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
-        await File.WriteAllTextAsync(fileName, json, Encoding.UTF8);
+        CookieFileHelper.TryWriteCookieFile(fileName, cookies, Log);
         Log($"Đã lưu {cookies.Count} cookie -> {fileName}");
-    }
-
-    public async Task OpenBigSellerPageAsync()
-    {
-        var wsUrl = await EnsureBigSellerPageTargetAsync().ConfigureAwait(false);
-        try
-        {
-            using var page = new ClientWebSocket();
-            await page.ConnectAsync(new Uri(wsUrl), CancellationToken.None).ConfigureAwait(false);
-            await SendCdpAsync(page, 92, "Page.navigate",
-                new { url = "https://www.bigseller.com/web/" }).ConfigureAwait(false);
-        }
-        catch { }
     }
 
     public async Task ImportCookiesAsync(IWin32Window? owner)
@@ -1253,30 +1386,18 @@ internal sealed class BraveInstanceSession : IDisposable
         if (dlg.ShowDialog(owner) != DialogResult.OK) return;
 
         var json = await File.ReadAllTextAsync(dlg.FileName, Encoding.UTF8);
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-        var cookiesEl = root.TryGetProperty("cookies", out var cp) ? cp : root;
-        if (cookiesEl.ValueKind != JsonValueKind.Array)
-            throw new InvalidOperationException("File cookie không hợp lệ.");
-
-        if (!_config.ExportShopee && !_config.ExportBigSeller)
-            throw new InvalidOperationException("Chọn ít nhất Shopee hoặc BigSeller.");
+        var cookiesEl = CookieFileHelper.ParseCookiesRoot(json);
+        CookieFileHelper.ValidateCookiesArray(cookiesEl);
 
         var count = await SetCookiesToBraveAsync(
             cookiesEl,
-            _config.ExportShopee,
-            _config.ExportBigSeller,
-            preferredWsUrl: _config.ExportBigSeller ? await EnsureBigSellerPageTargetAsync() : null);
-        if (_config.ExportBigSeller)
-            await ReloadBigSellerTabsAsync();
-            Log($"Đã nhập {count} cookie.");
+            true);
+        Log($"Đã nhập {count} cookie.");
     }
 
     public async Task<int> ImportCookiesFromFileAsync(
         string fileName,
-        bool includeShopee,
-        bool includeBigSeller,
-        bool prepareBigSellerPage = false)
+        bool includeShopee)
     {
         if (string.IsNullOrWhiteSpace(fileName))
             return 0;
@@ -1284,27 +1405,15 @@ internal sealed class BraveInstanceSession : IDisposable
             throw new FileNotFoundException("Không tìm thấy file cookie.", fileName);
 
         var json = await File.ReadAllTextAsync(fileName, Encoding.UTF8);
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-        var cookiesEl = root.TryGetProperty("cookies", out var cp) ? cp : root;
-        if (cookiesEl.ValueKind != JsonValueKind.Array)
-            throw new InvalidOperationException("File cookie không hợp lệ.");
+        var cookiesEl = CookieFileHelper.ParseCookiesRoot(json);
+        CookieFileHelper.ValidateCookiesArray(cookiesEl);
 
         if (!await WaitForCdpReadyAsync().ConfigureAwait(false))
             throw new InvalidOperationException("Profile khong con ket noi CDP (co the dang restart hoac da tat).");
 
-        var preferredWsUrl = prepareBigSellerPage && includeBigSeller
-            ? await EnsureBigSellerPageTargetAsync()
-            : null;
-        var count = await SetCookiesToBraveAsync(cookiesEl, includeShopee, includeBigSeller, preferredWsUrl);
-        if (prepareBigSellerPage && includeBigSeller)
-        {
-            await ReloadBigSellerTabsAsync();
-            await Task.Delay(1500).ConfigureAwait(false);
-            var verified = await CountBigSellerCookiesAsync().ConfigureAwait(false);
-            Log($"Cookie BigSeller trong Brave sau import: {verified}.");
-        }
-        return count;
+        return await SetCookiesToBraveAsync(
+            cookiesEl,
+            includeShopee).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1394,24 +1503,26 @@ internal sealed class BraveInstanceSession : IDisposable
             ExtensionProgressSynced?.Invoke();
     }
 
-    public async Task OpenShopeeAccountLoginAsync()
+    public async Task<bool> OpenShopeeAccountLoginAsync()
     {
-        if (_config is null)
-            return;
+        if (_config is null || !_running)
+            return false;
 
         try
         {
             if (!TryParseShopeeAccountLogin(_config.ShopeeAccountLogin, out var login, out var parseError))
             {
                 Log($"Shopee login: {parseError}");
-                return;
+                return false;
             }
 
-            for (var i = 0; i < 20; i++)
+            var cdpReady = false;
+            for (var i = 0; i < 20 && _running; i++)
             {
                 try
                 {
                     _ = await GetBrowserWebSocketUrlAsync().ConfigureAwait(false);
+                    cdpReady = true;
                     break;
                 }
                 catch
@@ -1420,14 +1531,28 @@ internal sealed class BraveInstanceSession : IDisposable
                 }
             }
 
+            if (!cdpReady || !_running)
+            {
+                Log("Shopee login: CDP không sẵn sàng — profile có thể đã đóng.");
+                return false;
+            }
+
             await SetShopeeSpcFCookieAsync(login).ConfigureAwait(false);
+            if (!_running)
+                return false;
+
             await OpenShopeeLoginPageAsync().ConfigureAwait(false);
+            if (!_running)
+                return false;
+
             await FillShopeeLoginFormAsync(login).ConfigureAwait(false);
             Log($"Shopee login: đã mở trang đăng nhập và điền tài khoản {login.Username}.");
+            return true;
         }
         catch (Exception ex)
         {
             Log($"Shopee login lỗi: {ex.Message}");
+            return false;
         }
     }
 
@@ -1459,22 +1584,13 @@ internal sealed class BraveInstanceSession : IDisposable
     {
         const string loginUrl = "https://shopee.vn/buyer/login?next=https%3A%2F%2Fshopee.vn";
 
-        using var browser = new ClientWebSocket();
-        await browser.ConnectAsync(new Uri(await GetBrowserWebSocketUrlAsync().ConfigureAwait(false)), CancellationToken.None);
-        var created = await SendCdpAsync(browser, 720, "Target.createTarget", new { url = loginUrl });
-        var targetId = created.TryGetProperty("targetId", out var targetEl)
-            ? targetEl.GetString()
-            : null;
+        var wsUrl = await _cdpClient.EnsurePageTargetAsync(
+            url => url.StartsWith("https://shopee.vn/buyer/login", StringComparison.OrdinalIgnoreCase),
+            loginUrl).ConfigureAwait(false);
 
-        for (var i = 0; i < 40; i++)
-        {
-            await Task.Delay(300).ConfigureAwait(false);
-            var ws = await FindPageWebSocketUrlAsync(url =>
-                (!string.IsNullOrWhiteSpace(targetId) && url.Contains(targetId, StringComparison.OrdinalIgnoreCase)) ||
-                url.StartsWith("https://shopee.vn/buyer/login", StringComparison.OrdinalIgnoreCase));
-            if (!string.IsNullOrWhiteSpace(ws))
-                return;
-        }
+        using var page = new ClientWebSocket();
+        await page.ConnectAsync(new Uri(wsUrl), CancellationToken.None).ConfigureAwait(false);
+        await SendCdpAsync(page, 721, "Page.navigate", new { url = loginUrl });
     }
 
     private async Task FillShopeeLoginFormAsync(ShopeeAccountLogin login)
@@ -1572,417 +1688,25 @@ internal sealed class BraveInstanceSession : IDisposable
             throw lastError;
     }
 
-    private async Task EnsureBigSellerCookiesReadyAsync()
-    {
-        if (_lastBigSellerImportAt is not null &&
-            DateTimeOffset.Now - _lastBigSellerImportAt.Value < TimeSpan.FromSeconds(60))
-            return;
-
-        await AutoImportBigSellerCookiesAsync(force: false).ConfigureAwait(false);
-    }
-
-    private async Task AutoImportBigSellerCookiesAsync(bool force = true)
-    {
-        if (_config is null ||
-            !_config.ExportBigSeller ||
-            string.IsNullOrWhiteSpace(_config.BigSellerCookieFile))
-            return;
-
-        if (!force &&
-            _lastBigSellerImportAt is not null &&
-            DateTimeOffset.Now - _lastBigSellerImportAt.Value < TimeSpan.FromSeconds(60))
-            return;
-
-        try
-        {
-            for (var i = 0; i < 20; i++)
-            {
-                try
-                {
-                    _ = await GetCdpWebSocketUrlAsync().ConfigureAwait(false);
-                    break;
-                }
-                catch
-                {
-                    await Task.Delay(500).ConfigureAwait(false);
-                }
-            }
-
-            // Browser còn token đăng nhập BigSeller -> giữ nguyên phiên sống, không ghi đè
-            // bằng file tĩnh (file cũ dễ chứa token đã bị server thu hồi -> ghi đè là văng phiên).
-            // Lúc Start (force) probe thêm trang app — profile dùng lại có thể giữ token đã chết;
-            // giữa run thì không probe để khỏi điều hướng phá automation đang chạy.
-            var liveCookies = await TryGetBigSellerCookiesFromBrowserAsync().ConfigureAwait(false);
-            if (BigSellerCookieImporter.HasAuthCookie(liveCookies))
-            {
-                var alive = !force ||
-                    await BigSellerCookieImporter.ProbeLoggedInAsync(_cdpPort, log: Log).ConfigureAwait(false) != false;
-                if (alive)
-                {
-                    _lastBigSellerImportAt = DateTimeOffset.Now;
-                    if (force)
-                        Log("Phiên BigSeller trong browser còn sống — giữ nguyên, không nạp lại cookie từ file.");
-                    await WriteBackBigSellerCookiesIfRotatedAsync(liveCookies).ConfigureAwait(false);
-                    return;
-                }
-
-                Log("Token BigSeller trong profile đã bị server thu hồi — nạp lại cookie từ file account.");
-            }
-
-            var sourceFile = ResolveBigSellerImportSource();
-            var count = await ImportCookiesFromFileAsync(
-                sourceFile,
-                includeShopee: false,
-                includeBigSeller: true,
-                prepareBigSellerPage: true).ConfigureAwait(false);
-            _lastBigSellerImportAt = DateTimeOffset.Now;
-            _lastBigSellerAuthStamp = BigSellerCookieImporter.BuildAuthStamp(
-                await TryGetBigSellerCookiesFromBrowserAsync().ConfigureAwait(false));
-            var sourceLabel = string.Equals(sourceFile, _config.BigSellerCookieFile, StringComparison.OrdinalIgnoreCase)
-                ? "file account"
-                : "phiên riêng của instance";
-            Log($"Đã tự nhập {count} cookie BigSeller ({sourceLabel}).");
-        }
-        catch (Exception ex)
-        {
-            Log($"Tự nhập cookie BigSeller lỗi: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// File cookie phiên RIÊNG của instance — seed từ file account, sau đó mỗi instance
-    /// tự tiến hóa phiên độc lập; write-back không đụng file account hay instance khác.
-    /// </summary>
-    private string? ResolveInstanceCookieFile()
-    {
-        if (_config is null || string.IsNullOrWhiteSpace(_config.BigSellerCookieFile))
-            return null;
-
-        if (string.IsNullOrWhiteSpace(_config.AccountId) || string.IsNullOrWhiteSpace(_config.Id))
-            return _config.BigSellerCookieFile;
-
-        return AppSession.ResolvePersistentDataPath(
-            "account-cookies", _config.AccountId, "instances", $"{_config.Id}-bigseller.json");
-    }
-
-    /// <summary>
-    /// Nguồn import: file MỚI HƠN giữa file account (cập nhật khi login tay ở tab Account)
-    /// và file phiên riêng của instance (cập nhật khi write-back) — vì vậy login lại ở
-    /// account luôn thắng phiên riêng cũ hơn của instance.
-    /// </summary>
-    private string ResolveBigSellerImportSource()
-    {
-        var master = _config!.BigSellerCookieFile;
-        var instanceFile = ResolveInstanceCookieFile();
-        if (string.IsNullOrWhiteSpace(instanceFile) ||
-            string.Equals(instanceFile, master, StringComparison.OrdinalIgnoreCase) ||
-            !File.Exists(instanceFile))
-            return master;
-
-        if (!File.Exists(master))
-            return instanceFile;
-
-        return File.GetLastWriteTimeUtc(instanceFile) >= File.GetLastWriteTimeUtc(master)
-            ? instanceFile
-            : master;
-    }
-
-    private async Task<List<Dictionary<string, object?>>> TryGetBigSellerCookiesFromBrowserAsync()
-    {
-        try
-        {
-            var cookies = await GetAllCookiesFromBraveAsync().ConfigureAwait(false);
-            return cookies.Where(BigSellerCookieImporter.IsBigSellerCookie).ToList();
-        }
-        catch
-        {
-            return [];
-        }
-    }
-
-    /// <summary>
-    /// BigSeller xoay token mới trong browser -> lưu vào file phiên RIÊNG của instance
-    /// (không đụng file account — file account chỉ cập nhật khi login tay ở tab Account).
-    /// Chỉ ghi khi token thật sự đổi so với lần nạp/ghi gần nhất.
-    /// </summary>
-    private async Task WriteBackBigSellerCookiesIfRotatedAsync(
-        List<Dictionary<string, object?>>? bigSellerCookies = null)
-    {
-        if (_config is null ||
-            !_config.ExportBigSeller ||
-            string.IsNullOrWhiteSpace(_config.BigSellerCookieFile))
-            return;
-
-        bigSellerCookies ??= await TryGetBigSellerCookiesFromBrowserAsync().ConfigureAwait(false);
-        if (!BigSellerCookieImporter.HasAuthCookie(bigSellerCookies))
-            return;
-
-        var stamp = BigSellerCookieImporter.BuildAuthStamp(bigSellerCookies);
-        if (string.Equals(stamp, _lastBigSellerAuthStamp, StringComparison.Ordinal))
-            return;
-
-        var target = ResolveInstanceCookieFile();
-        if (string.IsNullOrWhiteSpace(target))
-            return;
-
-        if (BigSellerCookieImporter.TryWriteCookieFile(target, bigSellerCookies, Log))
-        {
-            _lastBigSellerAuthStamp = stamp;
-            Log($"Token BigSeller đã được làm mới — lưu {bigSellerCookies.Count} cookie vào phiên riêng của instance.");
-        }
-    }
-
     private Task<string> GetCdpWebSocketUrlAsync() =>
         _cdpClient.GetPageWebSocketUrlAsync();
     private Task<string> GetBrowserWebSocketUrlAsync() =>
         _cdpClient.GetBrowserWebSocketUrlAsync();
     private Task<string?> FindPageWebSocketUrlAsync(Func<string, bool> urlMatches) =>
         _cdpClient.FindPageWebSocketUrlAsync(urlMatches);
-    private Task<string> EnsureBigSellerPageTargetAsync() =>
-        _cdpClient.EnsurePageTargetAsync(IsBigSellerUrl, "https://www.bigseller.com/");
-    private async Task ReloadBigSellerTabsAsync()
-    {
-        try
-        {
-            await _cdpClient.ReloadPageTargetsAsync(IsBigSellerUrl).ConfigureAwait(false);
-        }
-        catch
-        {
-            // reload chi de BigSeller nhan cookie moi; loi reload khong chan scrape.
-        }
-    }
-    private static bool IsBigSellerUrl(string url) =>
-        Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
-        uri.Host.Contains("bigseller", StringComparison.OrdinalIgnoreCase);
-
-    private Task<int> CountBigSellerCookiesAsync() =>
-        _cookieService.CountDomainCookiesAsync("bigseller");
     private static Task<JsonElement> SendCdpAsync(ClientWebSocket socket, int id, string method, object? @params) =>
         CdpClient.SendAsync(socket, id, method, @params);
     private Task<List<Dictionary<string, object?>>> GetAllCookiesFromBraveAsync() =>
-        _cookieService.GetShopeeAndBigSellerCookiesAsync();
-    private async Task<int> SetCookiesToBraveAsync(
+        _cookieService.GetShopeeCookiesAsync();
+
+    private Task<int> SetCookiesToBraveAsync(
         JsonElement cookiesArray,
-        bool includeShopee,
-        bool includeBigseller,
-        string? preferredWsUrl = null)
-    {
-        var wsUrl = string.IsNullOrWhiteSpace(preferredWsUrl)
-            ? await GetCdpWebSocketUrlAsync()
-            : preferredWsUrl;
-        using var socket = new ClientWebSocket();
-        await socket.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
-        await SendCdpAsync(socket, 1, "Network.enable", new { });
-
-        var attempted = 0;
-        var succeeded = 0;
-        var cmdId = 1000;
-
-        foreach (var cookie in cookiesArray.EnumerateArray())
-        {
-            if (cookie.ValueKind != JsonValueKind.Object) continue;
-
-            var domain = cookie.TryGetProperty("domain", out var dp) ? (dp.GetString() ?? "") : "";
-            var lower = domain.ToLowerInvariant();
-            var isShopee = lower.Contains("shopee");
-            var isBigseller = lower.Contains("bigseller");
-            if (isShopee && !includeShopee) continue;
-            if (isBigseller && !includeBigseller) continue;
-            if (!isShopee && !isBigseller) continue;
-
-            var payload = new Dictionary<string, object?>();
-            foreach (var k in new[]
-            {
-                "name", "value", "url", "domain", "path",
-                "secure", "httpOnly", "sameSite", "expires",
-                "priority", "sourceScheme", "sourcePort",
-            })
-            {
-                if (!cookie.TryGetProperty(k, out var v)) continue;
-                payload[k] = v.ValueKind switch
-                {
-                    JsonValueKind.String => v.GetString(),
-                    JsonValueKind.Number => v.TryGetInt64(out var i) ? i : v.GetDouble(),
-                    JsonValueKind.True => true,
-                    JsonValueKind.False => false,
-                    _ => null,
-                };
-            }
-
-            if (!payload.ContainsKey("name") || !payload.ContainsKey("value")) continue;
-            if (!payload.ContainsKey("url") && !payload.ContainsKey("domain")) continue;
-
-            if (!payload.ContainsKey("url") && payload.TryGetValue("domain", out var dv))
-            {
-                var ds = (dv as string ?? "").TrimStart('.');
-                if (!string.IsNullOrEmpty(ds))
-                    payload["url"] = $"https://{ds}/";
-            }
-
-            var cookieName = payload.TryGetValue("name", out var nv) ? nv as string ?? "" : "";
-            if (cookieName.StartsWith("__Host-", StringComparison.OrdinalIgnoreCase))
-            {
-                payload.Remove("domain");
-                payload["path"] = "/";
-            }
-
-            SanitizeCookiePayloadForCdp(payload, persistSessionCookie: isBigseller);
-
-            attempted++;
-            try
-            {
-                var storageOk = await TrySetCookieWithBrowserStorageAsync(payload).ConfigureAwait(false);
-                var result = await SendCdpAsync(socket, cmdId++, "Network.setCookie", payload);
-                var ok = result.TryGetProperty("success", out var sp) && sp.GetBoolean();
-                if (!ok)
-                {
-                    var fb = new Dictionary<string, object?>(payload);
-                    fb.Remove("sourceScheme");
-                    fb.Remove("sourcePort");
-                    var fbResult = await SendCdpAsync(socket, cmdId++, "Network.setCookie", fb);
-                    ok = fbResult.TryGetProperty("success", out var fp) && fp.GetBoolean();
-                }
-                if (!ok && storageOk)
-                    ok = true;
-                if (isBigseller && TryBuildBigSellerProPayload(payload, out var proPayload))
-                {
-                    try
-                    {
-                        var proStorageOk = await TrySetCookieWithBrowserStorageAsync(proPayload).ConfigureAwait(false);
-                        var proResult = await SendCdpAsync(socket, cmdId++, "Network.setCookie", proPayload);
-                        var proOk = proResult.TryGetProperty("success", out var psp) && psp.GetBoolean();
-                        if (!proOk)
-                        {
-                            var fb = new Dictionary<string, object?>(proPayload);
-                            fb.Remove("sourceScheme");
-                            fb.Remove("sourcePort");
-                            var fbResult = await SendCdpAsync(socket, cmdId++, "Network.setCookie", fb);
-                            proOk = fbResult.TryGetProperty("success", out var pfp) && pfp.GetBoolean();
-                        }
-                        _ = proOk || proStorageOk;
-                    }
-                    catch
-                    {
-                        // Compatibility copy only; .com remains the primary BigSeller cookie import.
-                    }
-                }
-                if (ok) succeeded++;
-            }
-            catch (Exception ex)
-            {
-                Log($"Cookie lỗi {cookieName}: {ex.Message}");
-            }
-        }
-
-        Log($"Cookie import: thử {attempted}, thành công {succeeded}.");
-        return succeeded;
-    }
-
-    private async Task<bool> TrySetCookieWithBrowserStorageAsync(Dictionary<string, object?> payload)
-    {
-        try
-        {
-            using var browser = new ClientWebSocket();
-            await browser.ConnectAsync(new Uri(await GetBrowserWebSocketUrlAsync()), CancellationToken.None);
-            await SendCdpAsync(browser, 700, "Storage.setCookies", new { cookies = new[] { payload } });
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool TryBuildBigSellerProPayload(
-        Dictionary<string, object?> source,
-        out Dictionary<string, object?> payload)
-    {
-        payload = new Dictionary<string, object?>(source);
-        var changed = false;
-
-        if (payload.TryGetValue("domain", out var domainValue) &&
-            domainValue is string domain &&
-            domain.Contains("bigseller.com", StringComparison.OrdinalIgnoreCase))
-        {
-            payload["domain"] = domain.Replace("bigseller.com", "bigseller.pro", StringComparison.OrdinalIgnoreCase);
-            changed = true;
-        }
-
-        if (payload.TryGetValue("url", out var urlValue) &&
-            urlValue is string url &&
-            url.Contains("bigseller.com", StringComparison.OrdinalIgnoreCase))
-        {
-            payload["url"] = url.Replace("bigseller.com", "bigseller.pro", StringComparison.OrdinalIgnoreCase);
-            changed = true;
-        }
-
-        return changed;
-    }
-
-    private static void SanitizeCookiePayloadForCdp(
-        Dictionary<string, object?> payload,
-        bool persistSessionCookie)
-    {
-        foreach (var key in payload.Where(kv => kv.Value is null).Select(kv => kv.Key).ToList())
-            payload.Remove(key);
-
-        foreach (var key in new[] { "name", "value", "url", "domain", "path", "sameSite", "priority", "sourceScheme" })
-        {
-            if (payload.TryGetValue(key, out var value) &&
-                value is string s &&
-                string.IsNullOrWhiteSpace(s))
-                payload.Remove(key);
-        }
-
-        if (payload.TryGetValue("sameSite", out var sameSite) && sameSite is string ss)
-        {
-            var normalized = ss.Trim();
-            if (normalized.Equals("no_restriction", StringComparison.OrdinalIgnoreCase) ||
-                normalized.Equals("none", StringComparison.OrdinalIgnoreCase))
-                payload["sameSite"] = "None";
-            else if (normalized.Equals("lax", StringComparison.OrdinalIgnoreCase))
-                payload["sameSite"] = "Lax";
-            else if (normalized.Equals("strict", StringComparison.OrdinalIgnoreCase))
-                payload["sameSite"] = "Strict";
-            else
-                payload.Remove("sameSite");
-        }
-
-        if (payload.TryGetValue("expires", out var expires))
-        {
-            var value = expires switch
-            {
-                long l => l,
-                int i => i,
-                double d => d,
-                _ => 0,
-            };
-            if (value <= 0)
-            {
-                if (persistSessionCookie)
-                    payload["expires"] = DateTimeOffset.UtcNow.AddDays(30).ToUnixTimeSeconds();
-                else
-                    payload.Remove("expires");
-            }
-        }
-        else if (persistSessionCookie)
-        {
-            payload["expires"] = DateTimeOffset.UtcNow.AddDays(30).ToUnixTimeSeconds();
-        }
-
-        if (payload.TryGetValue("sourcePort", out var sourcePort))
-        {
-            var value = sourcePort switch
-            {
-                long l => l,
-                int i => i,
-                double d => d,
-                _ => 0,
-            };
-            if (value < 0)
-                payload.Remove("sourcePort");
-        }
-    }
+        bool includeShopee) =>
+        CookieCdpWriter.SetCookiesFromJsonAsync(
+            _cdpClient,
+            cookiesArray,
+            new CookieImportFilter(includeShopee),
+            Log);
 
     private void SetStatus(string text)
     {

@@ -400,8 +400,170 @@ public sealed class SearchTaskStore
                     scanned_at TEXT NOT NULL,
                     UNIQUE(shop_id, item_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS categories (
+                    name TEXT PRIMARY KEY COLLATE NOCASE,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                );
                 """;
             cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Một danh mục trong "từ điển" danh mục (số liệu tính trực tiếp từ shop_products).</summary>
+    public sealed record CategoryRow(string Name, int ProductCount, int ShopCount, string FirstSeen, string LastSeen);
+
+    /// <summary>Upsert danh mục (theo tên, không phân biệt hoa/thường): có thì cập nhật last_seen,
+    /// chưa có thì thêm mới. Gọi tự động khi lưu sản phẩm shop (quét shop).</summary>
+    public void UpsertCategories(IEnumerable<string> names)
+    {
+        var distinct = names
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Select(n => n.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (distinct.Count == 0) return;
+
+        lock (_sync)
+        {
+            using var con = Open();
+            using var tx = con.BeginTransaction();
+            var now = DateTime.Now.ToString("O");
+            foreach (var name in distinct)
+            {
+                using var cmd = con.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = """
+                    INSERT INTO categories (name, first_seen, last_seen)
+                    VALUES ($name, $now, $now)
+                    ON CONFLICT(name) DO UPDATE SET last_seen=excluded.last_seen
+                    """;
+                Add(cmd, "$name", name);
+                Add(cmd, "$now", now);
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+    }
+
+    /// <summary>Tất cả sản phẩm shop (shopId, itemId, name) — để phân loại lại danh mục bằng AI theo tên.</summary>
+    public List<(long ShopId, long ItemId, string Name)> GetAllShopProductsForCategory()
+    {
+        lock (_sync)
+        {
+            using var con = Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = "SELECT shop_id, item_id, name FROM shop_products ORDER BY id";
+            using var reader = cmd.ExecuteReader();
+            var list = new List<(long, long, string)>();
+            while (reader.Read())
+                list.Add((reader.GetInt64(0), reader.GetInt64(1), GetString(reader, "name")));
+            return list;
+        }
+    }
+
+    /// <summary>Xóa các danh mục không còn sản phẩm nào tham chiếu (dọn danh mục rác sau khi phân loại lại).</summary>
+    public void PruneUnusedCategories()
+    {
+        lock (_sync)
+        {
+            using var con = Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = """
+                DELETE FROM categories
+                WHERE name NOT IN (SELECT DISTINCT category FROM shop_products WHERE TRIM(category) <> '')
+                """;
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Ghi danh mục cho các sản phẩm shop (sau khi phân loại bằng AI), rồi upsert vào từ điển.</summary>
+    public void SetShopProductCategories(IReadOnlyList<(long ShopId, long ItemId, string Category)> updates)
+    {
+        if (updates.Count == 0) return;
+        lock (_sync)
+        {
+            using var con = Open();
+            using var tx = con.BeginTransaction();
+            foreach (var u in updates)
+            {
+                using var cmd = con.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = "UPDATE shop_products SET category = $c WHERE shop_id = $s AND item_id = $i";
+                Add(cmd, "$c", u.Category);
+                Add(cmd, "$s", u.ShopId);
+                Add(cmd, "$i", u.ItemId);
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+        UpsertCategories(updates.Select(u => u.Category));
+    }
+
+    /// <summary>Sản phẩm shop thuộc 1 danh mục (theo tên, không phân biệt hoa/thường) — cho tab Danh mục.</summary>
+    public List<ProductResult> GetShopProductsByCategory(string category)
+    {
+        lock (_sync)
+        {
+            using var con = Open();
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = "SELECT * FROM shop_products WHERE category = $c COLLATE NOCASE ORDER BY monthly_sold DESC, id";
+            Add(cmd, "$c", category);
+            using var reader = cmd.ExecuteReader();
+            var products = new List<ProductResult>();
+            while (reader.Read())
+            {
+                products.Add(new ProductResult
+                {
+                    ItemId = reader.GetInt64(reader.GetOrdinal("item_id")),
+                    ShopId = reader.GetInt64(reader.GetOrdinal("shop_id")),
+                    Name = GetString(reader, "name"),
+                    PriceVnd = GetDecimal(reader, "price_vnd"),
+                    PriceOriginalVnd = GetDecimal(reader, "original_price_vnd"),
+                    MonthlySold = GetInt(reader, "monthly_sold"),
+                    Rating = GetDouble(reader, "rating"),
+                    LikedCount = GetInt(reader, "liked_count"),
+                    CommentCount = GetInt(reader, "comment_count"),
+                    ShopLocation = GetString(reader, "shop_location"),
+                    ImageUrl = GetString(reader, "image_url"),
+                    Category = GetString(reader, "category"),
+                    ShopName = GetString(reader, "shop_name"),
+                });
+            }
+            return products;
+        }
+    }
+
+    /// <summary>Đọc từ điển danh mục kèm số sản phẩm / số shop (tính từ shop_products theo tên).</summary>
+    public List<CategoryRow> GetCategories()
+    {
+        lock (_sync)
+        {
+            using var con = Open();
+            using var cmd = con.CreateCommand();
+            // LEFT JOIN để danh mục chưa có sản phẩm (vd shop_products bị xoá) vẫn hiện với count 0.
+            cmd.CommandText = """
+                SELECT c.name AS name, c.first_seen AS first_seen, c.last_seen AS last_seen,
+                       COUNT(sp.item_id) AS product_count,
+                       COUNT(DISTINCT sp.shop_id) AS shop_count
+                FROM categories c
+                LEFT JOIN shop_products sp ON sp.category = c.name COLLATE NOCASE
+                GROUP BY c.name
+                ORDER BY product_count DESC, c.name COLLATE NOCASE
+                """;
+            using var reader = cmd.ExecuteReader();
+            var rows = new List<CategoryRow>();
+            while (reader.Read())
+            {
+                rows.Add(new CategoryRow(
+                    GetString(reader, "name"),
+                    GetInt(reader, "product_count"),
+                    GetInt(reader, "shop_count"),
+                    GetString(reader, "first_seen"),
+                    GetString(reader, "last_seen")));
+            }
+            return rows;
         }
     }
 
@@ -458,6 +620,9 @@ public sealed class SearchTaskStore
             }
             tx.Commit();
         }
+
+        // Tự upsert danh mục từ các sản phẩm vừa quét của shop này.
+        UpsertCategories(products.Select(p => p.Category));
     }
 
     /// <summary>Reads stored products for a shop (for re-export).</summary>
@@ -531,6 +696,48 @@ public sealed class SearchTaskStore
             }
             return byItem.Values.ToList();
         }
+    }
+
+    /// <summary>Xóa task + sản phẩm của tab "Tìm với từ khóa" (keyword không phải URL).</summary>
+    public void ClearKeywordSearchHistory()
+    {
+        lock (_sync)
+        {
+            using var con = Open();
+            using var tx = con.BeginTransaction();
+            Exec(con, tx, """
+                DELETE FROM task_products
+                WHERE task_id IN (SELECT id FROM search_tasks WHERE keyword NOT LIKE 'http%')
+                """);
+            Exec(con, tx, "DELETE FROM search_tasks WHERE keyword NOT LIKE 'http%'");
+            tx.Commit();
+        }
+    }
+
+    /// <summary>Xóa task link + bảng shop_products của tab "Tìm theo file".</summary>
+    public void ClearFileSearchHistory()
+    {
+        lock (_sync)
+        {
+            using var con = Open();
+            using var tx = con.BeginTransaction();
+            Exec(con, tx, """
+                DELETE FROM task_products
+                WHERE task_id IN (SELECT id FROM search_tasks WHERE keyword LIKE 'http%')
+                """);
+            Exec(con, tx, "DELETE FROM search_tasks WHERE keyword LIKE 'http%'");
+            Exec(con, tx, "DELETE FROM shop_products");
+            Exec(con, tx, "DELETE FROM categories");
+            tx.Commit();
+        }
+    }
+
+    private static void Exec(SqliteConnection con, SqliteTransaction tx, string sql)
+    {
+        using var cmd = con.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
     }
 
     private SqliteConnection Open()

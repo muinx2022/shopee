@@ -24,13 +24,10 @@ public sealed class InstanceConfig
 
     /// <summary>
     /// Profile nằm trong persistent-data (bền) thay vì runtime-sessions (ephemeral, bị xoá mỗi phiên).
-    /// Dùng cho profile login BigSeller dùng chung per-account: login tay persist + chung jar với workflow.
     /// </summary>
     public bool UsePersistentSharedProfile { get; set; }
     public bool CreateNewProfileOnNextStart { get; set; }
     public bool ExportShopee { get; set; } = true;
-    public bool ExportBigSeller { get; set; } = true;
-    public string BigSellerCookieFile { get; set; } = "";
     public string ShopeeAccountLogin { get; set; } = "";
     public bool OpenWithShopeeAccount { get; set; }
 
@@ -59,7 +56,15 @@ public sealed class InstanceConfig
     public string? RunnerPhase { get; set; }
     public bool? RunnerRunning { get; set; }
     public string? LastRunnerMessage { get; set; }
+
+    /// <summary>
+    /// Profile bị captcha chặn TRONG LÚC CHẠY AUTO → đánh dấu lỗi và đẩy sang tab Error.
+    /// CHỈ bật ở phiên auto; chạy manual có người kiểm soát nên không đánh dấu (giữ ở tab Normal).
+    /// Xoá khi user bấm "Đã giải captcha" hoặc khi instance được chạy lại.
+    /// </summary>
+    public bool CaptchaError { get; set; }
     public List<RunnerLogEntry> RunLog { get; set; } = [];
+    public List<PendingScrapeLink> PendingScrapeLinks { get; set; } = [];
     public DateTimeOffset? ProgressSyncedAt { get; set; }
 
     [JsonIgnore]
@@ -212,4 +217,13 @@ public sealed class InstanceConfig
 
     [JsonIgnore]
     public int? SuggestedResumeRow => ComputeSuggestedNextRow();
+}
+
+public sealed class PendingScrapeLink
+{
+    public int RowNumber { get; set; }
+    public string SheetName { get; set; } = "";
+    public string Link { get; set; } = "";
+    public DateTimeOffset SavedAt { get; set; } = DateTimeOffset.Now;
+    public string Reason { get; set; } = "";
 }

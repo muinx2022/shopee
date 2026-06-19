@@ -7,10 +7,16 @@ public enum SearchRunOutcome
     NetworkError,
     Error,
     Cancelled,
+    /// <summary>
+    /// Lane mất kết nối / treo (không tiến triển) — hoặc user bấm "Kết nối lại". Coordinator sẽ
+    /// tự khởi động lại lane và tiếp tục TỪ CHECKPOINT (ưu tiên cùng account), không tính là lỗi
+    /// account và không bỏ từ khóa/link.
+    /// </summary>
+    Reconnect,
 }
 
 /// <summary>
-/// One self-contained crawl "lane": owns its own Brave window, WebSocket server (on a
+/// One self-contained crawl "lane": owns its own Edge window, WebSocket server (on a
 /// dynamically allocated port), orchestrator and CDP input controller. Runs a single
 /// (account, keyword) search to completion and raises events instead of touching the UI,
 /// so several sessions can run in parallel. Reusable across keywords — call
@@ -20,7 +26,7 @@ public sealed class SearchSession : IAsyncDisposable
 {
     private readonly AppSettingsService _appSettings;
     private readonly SearchTaskStore _taskStore;
-    private readonly BraveManager _brave;
+    private readonly EdgeManager _edge;
 
     private WebSocketServer? _ws;
     private SearchOrchestrator? _orchestrator;
@@ -29,6 +35,22 @@ public sealed class SearchSession : IAsyncDisposable
     public int LaneId { get; }
     public long TaskId { get; private set; }
     public IReadOnlyList<ProductResult> Results => _orchestrator?.Results ?? [];
+
+    /// <summary>Thông điệp lỗi của lần chạy gần nhất (outcome == Error) — để hiển thị lý do ở ô link.</summary>
+    public string? LastError { get; private set; }
+
+    // Watchdog "treo": mọi sự kiện (kết nối / progress / sản phẩm / checkpoint) chạm vào mốc này.
+    // Im lặng quá IdleTimeoutMs → coi như lane chết → tự kết nối lại (resolve Reconnect).
+    private const long IdleTimeoutMs = 120_000;
+    private long _lastActivityTick;
+    // Completion của lần RunAsync hiện tại — để RequestReconnect()/watchdog kết thúc sớm từ bên ngoài.
+    private volatile TaskCompletionSource<SearchRunOutcome>? _runCompletion;
+
+    private void Touch() => Interlocked.Exchange(ref _lastActivityTick, Environment.TickCount64);
+
+    /// <summary>User bấm "Kết nối lại" (hoặc tự động): kết thúc lần chạy hiện tại bằng Reconnect để
+    /// coordinator relaunch + tiếp tục từ checkpoint với cùng account. Không đụng tới account pool.</summary>
+    public void RequestReconnect() => _runCompletion?.TrySetResult(SearchRunOutcome.Reconnect);
 
     /// <summary>The shop name captured during a shop-from-link run (read before CloseBrowserAsync).</summary>
     public string ShopName => _orchestrator?.ShopName ?? "";
@@ -51,7 +73,7 @@ public sealed class SearchSession : IAsyncDisposable
         LaneId = laneId;
         _appSettings = appSettings;
         _taskStore = taskStore;
-        _brave = new BraveManager(appSettings);
+        _edge = new EdgeManager(appSettings);
     }
 
     public async Task<SearchRunOutcome> RunAsync(InstanceConfig account, SearchConfig config, CancellationToken ct, long resumeTaskId = 0)
@@ -63,24 +85,26 @@ public sealed class SearchSession : IAsyncDisposable
         // attempt's intended start (not a stale value from a previous keyword).
         LastCategoryIndex = Math.Max(1, config.ResumeCategoryIndex);
         LastPage = Math.Max(1, config.ResumePage);
+        LastError = null;
+        Touch(); // mốc hoạt động đầu tiên cho watchdog của lần chạy này
 
-        var port = BraveManager.FindFreePort();
+        var port = EdgeManager.FindFreePort();
 
         string? profileDir;
         string? proxy;
         try
         {
             profileDir = _appSettings.GetProfileDir(account);
-            proxy = await _brave.ResolveProxyAsync(account);
+            proxy = await _edge.ResolveProxyAsync(account);
         }
         catch (Exception ex)
         {
             Log?.Invoke(ex.Message);
-            BraveManager.ReleasePort(port); // never bound — don't leak the reservation
+            EdgeManager.ReleasePort(port); // never bound — don't leak the reservation
             return SearchRunOutcome.Error;
         }
 
-        // Bind the WS server on `port` and wire the orchestrator BEFORE launching Brave, so the
+        // Bind the WS server on `port` and wire the orchestrator BEFORE launching Edge, so the
         // extension reaches a live server the instant it connects: no window for another lane's
         // FindFreePort to grab this port, and no connect-before-listen race. The crawl stays gated —
         // PrepareSearch() runs only AFTER login below, so the extension's early "ready" (the launch
@@ -98,18 +122,20 @@ public sealed class SearchSession : IAsyncDisposable
         }
 
         _ws = new WebSocketServer(port);
-        _ws.Connected += () => ConnectionChanged?.Invoke(true);
-        _ws.Disconnected += () => ConnectionChanged?.Invoke(false);
+        _ws.Connected += () => { Touch(); ConnectionChanged?.Invoke(true); };
+        _ws.Disconnected += () => { Touch(); ConnectionChanged?.Invoke(false); };
 
         var completion = new TaskCompletionSource<SearchRunOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _runCompletion = completion;
         using var registration = ct.Register(() => completion.TrySetResult(SearchRunOutcome.Cancelled));
 
         _orchestrator = new SearchOrchestrator(_ws, _appSettings);
-        _orchestrator.ProgressChanged += msg => Log?.Invoke(msg);
-        _orchestrator.ProductFound += product => ProductFound?.Invoke(product);
+        _orchestrator.ProgressChanged += msg => { Touch(); Log?.Invoke(msg); };
+        _orchestrator.ProductFound += product => { Touch(); ProductFound?.Invoke(product); };
         _orchestrator.ProductPersisted += product => _taskStore.SaveProduct(TaskId, product);
         _orchestrator.CheckpointChanged += (categoryIndex, categoryName, page) =>
         {
+            Touch();
             LastCategoryIndex = Math.Max(1, categoryIndex);
             if (page > 0) LastPage = page;
             _taskStore.UpdateCheckpoint(TaskId, categoryIndex, categoryName, page);
@@ -131,6 +157,7 @@ public sealed class SearchSession : IAsyncDisposable
         };
         _orchestrator.ErrorOccurred += msg =>
         {
+            LastError = msg;
             _taskStore.UpdateStatus(TaskId, "Failed", msg);
             completion.TrySetResult(SearchRunOutcome.Error);
         };
@@ -138,17 +165,17 @@ public sealed class SearchSession : IAsyncDisposable
         _ws.Start();
         // The listener now owns the port (HTTP.sys binds synchronously), so the OS won't
         // hand it to another lane — release the reservation that guarded the pre-bind gap.
-        BraveManager.ReleasePort(port);
+        EdgeManager.ReleasePort(port);
 
-        _brave.Launch(account, profileDir, proxy, port);
-        Log?.Invoke("Brave đang khởi động...");
-        await _brave.CleanupRestoredTabsAsync(port, ct);
+        _edge.Launch(account, profileDir, proxy, port);
+        Log?.Invoke("Edge đang khởi động...");
+        await _edge.CleanupRestoredTabsAsync(port, ct);
 
         if (account.OpenWithShopeeAccount)
         {
             Log?.Invoke("Đang đăng nhập Shopee...");
             var loginSvc = new ShopeeLoginService(_appSettings);
-            var ok = await loginSvc.EnsureLoggedInAsync(account, _brave.CdpPort, m => Log?.Invoke(m), ct);
+            var ok = await loginSvc.EnsureLoggedInAsync(account, _edge.CdpPort, m => Log?.Invoke(m), ct);
             if (!ok)
             {
                 Log?.Invoke("Đăng nhập thất bại.");
@@ -169,20 +196,47 @@ public sealed class SearchSession : IAsyncDisposable
         _orchestrator.PrepareSearch(config);
 
         // Trusted-input controller; failure is non-fatal (extension falls back to synthetic events).
-        _cdpInput = new CdpInputController(_ws, _brave.CdpPort);
+        _cdpInput = new CdpInputController(_ws, _edge.CdpPort);
         _cdpInput.Log += msg => Log?.Invoke(msg);
         _ = _cdpInput.StartAsync(ct);
 
         // Watchdog phát hiện trang verify/captcha TRỰC TIẾP qua CDP (độc lập với extension/searchTabId):
         // nếu extension không nhận ra verify (vd searchTabId lệch, SW kẹt) thì lane vẫn đổi account
         // thay vì treo trên trang captcha.
-        _ = WatchForVerifyAsync(_brave.CdpPort, completion, ct);
+        _ = WatchForVerifyAsync(_edge.CdpPort, completion, ct);
+
+        // Watchdog "treo/mất kết nối": tự kết nối lại nếu lane im lặng quá lâu (xem WatchForIdleAsync).
+        _ = WatchForIdleAsync(completion, ct);
 
         Log?.Invoke("Chờ extension kết nối...");
-        return await completion.Task;
+        try { return await completion.Task; }
+        finally { _runCompletion = null; }
     }
 
-    // Polls Brave's CDP target list; if any page sits on a /verify/ (captcha) URL, resolve the run as
+    // Tự khôi phục lane treo: nếu không có sự kiện nào (kết nối/progress/sản phẩm/checkpoint) trong
+    // IdleTimeoutMs thì coi như lane chết (extension không kết nối lại được, SW kẹt, trang đứng...) và
+    // resolve Reconnect để coordinator relaunch + tiếp tục từ checkpoint — thay vì treo vô hạn.
+    private async Task WatchForIdleAsync(TaskCompletionSource<SearchRunOutcome> completion, CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested && !completion.Task.IsCompleted)
+            {
+                await Task.Delay(15000, ct);
+                if (completion.Task.IsCompleted) return;
+                var idle = Environment.TickCount64 - Interlocked.Read(ref _lastActivityTick);
+                if (idle >= IdleTimeoutMs)
+                {
+                    Log?.Invoke($"Mất kết nối/treo {idle / 1000}s — tự kết nối lại.");
+                    completion.TrySetResult(SearchRunOutcome.Reconnect);
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    // Polls Edge's CDP target list; if any page sits on a /verify/ (captcha) URL, resolve the run as
     // CaptchaOrVerify so the coordinator swaps account — even when the extension's own detection misses it.
     private async Task WatchForVerifyAsync(int cdpPort, TaskCompletionSource<SearchRunOutcome> completion, CancellationToken ct)
     {
@@ -226,7 +280,7 @@ public sealed class SearchSession : IAsyncDisposable
         try
         {
             await using var cdp = await CdpSession.ConnectToPageMatchingAsync(
-                _brave.CdpPort,
+                _edge.CdpPort,
                 url => url.Contains("shopee.vn", StringComparison.OrdinalIgnoreCase)
                        && !url.Contains("shopee.vn/api/", StringComparison.OrdinalIgnoreCase),
                 ct);
@@ -240,14 +294,14 @@ public sealed class SearchSession : IAsyncDisposable
         }
     }
 
-    /// <summary>Synchronous, best-effort kill of this lane's Brave window (for shutdown paths).</summary>
-    public void KillBrowser() => _brave.Kill();
+    /// <summary>Synchronous, best-effort kill of this lane's Edge window (for shutdown paths).</summary>
+    public void KillBrowser() => _edge.Kill();
 
-    /// <summary>Kills this lane's Brave window and tears down the run-scoped WS/CDP/orchestrator.</summary>
+    /// <summary>Kills this lane's Edge window and tears down the run-scoped WS/CDP/orchestrator.</summary>
     public async Task CloseBrowserAsync()
     {
         await DisposeRunScopedAsync();
-        _brave.Kill();
+        _edge.Kill();
     }
 
     private async Task DisposeRunScopedAsync()
@@ -266,3 +320,4 @@ public sealed class SearchSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync() => await CloseBrowserAsync();
 }
+

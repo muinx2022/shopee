@@ -35,7 +35,6 @@ internal static class LauncherSettings
                 if (data is not null)
                 {
                     NormalizeAccounts(data);
-                    IsolateAccountCookieFiles(data);
                     ResetSessionScopedPorts(data);
                     NormalizeRangeSettings(data);
                     foreach (var inst in data.Instances)
@@ -53,7 +52,6 @@ internal static class LauncherSettings
         if (imported is not null)
         {
             NormalizeAccounts(imported);
-            IsolateAccountCookieFiles(imported);
             ResetSessionScopedPorts(imported);
             foreach (var inst in imported.Instances)
                 EnsureInstanceShop(imported, inst);
@@ -65,7 +63,6 @@ internal static class LauncherSettings
             Instances = [InstanceConfig.CreateNew(1)],
         };
         NormalizeAccounts(settings);
-        IsolateAccountCookieFiles(settings);
         ResetSessionScopedPorts(settings);
         foreach (var inst in settings.Instances)
             EnsureInstanceShop(settings, inst);
@@ -151,7 +148,7 @@ internal static class LauncherSettings
     {
         data.Accounts ??= [];
         if (data.Accounts.Count == 0)
-            data.Accounts.Add(BigSellerAccountConfig.CreateDefault());
+            data.Accounts.Add(AccountConfig.CreateDefault());
 
         foreach (var account in data.Accounts)
         {
@@ -205,45 +202,6 @@ internal static class LauncherSettings
 
     private static void ResetSessionScopedPorts(LauncherSettingsFile data)
     {
-        foreach (var shop in data.Accounts.SelectMany(a => a.Shops))
-        {
-            shop.BigSellerDebugPort = 0;
-            shop.BigSellerImportDebugPort = 0;
-        }
-    }
-
-    private static void IsolateAccountCookieFiles(LauncherSettingsFile data)
-    {
-        MigrateLegacyPersistentData();
-
-        foreach (var account in data.Accounts)
-        {
-            var source = account.BigSellerCookieFile?.Trim() ?? "";
-            var target = AppSession.ResolvePersistentDataPath("account-cookies", $"{account.Id}-bigseller.json");
-
-            if (string.IsNullOrWhiteSpace(source) || !File.Exists(source))
-            {
-                account.BigSellerCookieFile = target;
-                continue;
-            }
-
-            if (string.Equals(Path.GetFullPath(source), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase))
-            {
-                account.BigSellerCookieFile = target;
-                continue;
-            }
-
-            try
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(target) ?? AppSession.RootDirectory);
-                File.Copy(source, target, overwrite: true);
-            }
-            catch
-            {
-            }
-
-            account.BigSellerCookieFile = target;
-        }
     }
 
     /// <summary>

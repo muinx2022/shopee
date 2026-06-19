@@ -17,7 +17,7 @@ public sealed class CdpSession : IAsyncDisposable
 
     public bool IsOpen => _ws?.State == WebSocketState.Open;
 
-    /// <summary>Polls until Brave's CDP HTTP endpoint responds, then connects to the first page.</summary>
+    /// <summary>Polls until Edge's CDP HTTP endpoint responds, then connects to the first page.</summary>
     public static async Task<CdpSession> ConnectToPageAsync(int cdpPort, CancellationToken ct = default)
     {
         // Wait for browser to start
@@ -181,3 +181,4 @@ public sealed class CdpSession : IAsyncDisposable
         _cts.Dispose();
     }
 }
+

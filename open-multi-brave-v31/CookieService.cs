@@ -5,7 +5,7 @@ namespace OpenMultiBraveLauncherV3;
 
 internal sealed class CookieService(CdpClient cdpClient)
 {
-    public async Task<List<Dictionary<string, object?>>> GetShopeeAndBigSellerCookiesAsync()
+    public async Task<List<Dictionary<string, object?>>> GetShopeeCookiesAsync()
     {
         var wsUrl = await cdpClient.GetPageWebSocketUrlAsync().ConfigureAwait(false);
         using var socket = new ClientWebSocket();
@@ -20,7 +20,7 @@ internal sealed class CookieService(CdpClient cdpClient)
         {
             var domain = cookie.TryGetProperty("domain", out var dp) ? (dp.GetString() ?? "") : "";
             var lower = domain.ToLowerInvariant();
-            if (!lower.Contains("shopee") && !lower.Contains("bigseller"))
+            if (!lower.Contains("shopee"))
                 continue;
 
             var map = new Dictionary<string, object?>();
@@ -44,7 +44,7 @@ internal sealed class CookieService(CdpClient cdpClient)
     {
         try
         {
-            var cookies = await GetShopeeAndBigSellerCookiesAsync().ConfigureAwait(false);
+            var cookies = await GetShopeeCookiesAsync().ConfigureAwait(false);
             return cookies.Count(c =>
                 c.TryGetValue("domain", out var domain) &&
                 (domain?.ToString() ?? "").Contains(domainPart, StringComparison.OrdinalIgnoreCase));

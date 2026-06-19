@@ -1,4 +1,4 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 namespace OpenMultiBraveLauncherV3;
 
 internal sealed class ShopeeWorkspaceControl : UserControl
@@ -8,22 +8,38 @@ internal sealed class ShopeeWorkspaceControl : UserControl
     private readonly string? _workspaceAccountId;
     private string _activeAccountId = "";
     private string _activeShopId = "";
+    // Buộc user chọn shop (combo) trước khi chạy — tránh chạy nhầm shop khi combo tự mặc định shop đầu.
+    private bool _shopChosenForRun;
+    private const string ShopPlaceholderId = "__choose_shop__";
     private readonly List<InstanceEntry> _entries = [];
     private InstanceEntry? _selected;
 
     private readonly SplitContainer _actionSplit;
     private readonly SplitContainer _split;
+    private readonly TabControl _instanceTabs;
     private readonly ListView _instanceList;
+    private readonly ListView _errorInstanceList;
+    private readonly Button _resolveCaptchaButton;
+    private ListView CurrentInstanceList => _instanceTabs.SelectedTab == _instanceTabs.TabPages[1]
+        ? _errorInstanceList
+        : _instanceList;
     private readonly InstanceDetailPanel _detailPanel;
     private readonly TabControl _logTabs;
     private readonly RichTextBox _logTextBox;
     private readonly ToolStripStatusLabel _statusStripLabel;
     private readonly System.Windows.Forms.Timer _allProgressTimer;
     private readonly BatchRunnerScheduler _batchScheduler = new();
+
+    // Tập profile được "đóng băng" tại thời điểm bấm Chạy tự động. Scheduler CHỈ chạy đúng các profile này
+    // và dừng hẳn sau khi xong cái cuối — KHÔNG quay lại từ đầu. Tránh việc giữa lượt range được tính lại
+    // (đổi account/shop đang xem, xóa/thêm instance làm dịch chỉ số) khiến profile ngoài ý muốn (vd 1,2,3)
+    // lọt vào diện chạy.
+    private readonly List<string> _batchPlannedIds = new();
     private readonly Dictionary<string, RichTextBox> _instanceLogTextBoxes = new(StringComparer.Ordinal);
     private Button? _startAutoButton;
     private Button? _stopAutoButton;
     private Button? _runSelectedButton;
+    private Button? _runFailedButton;
     private Button? _stopAllButton;
     private Button? _autoSetRowButton;
     private Label? _autoShopSheetLabel;
@@ -72,10 +88,17 @@ internal sealed class ShopeeWorkspaceControl : UserControl
 
         var instancePanel = new ShopeeInstanceListPanel(
             (_, _) => AddInstance(),
-            (_, _) => RemoveSelected());
+            (_, _) => RemoveSelected(),
+            (_, _) => ResolveSelectedCaptcha());
+        _instanceTabs = instancePanel.InstanceTabs;
         _instanceList = instancePanel.InstanceList;
-        _instanceList.SelectedIndexChanged += (_, _) => OnInstanceSelected();
-        _instanceList.MouseDoubleClick += async (_, e) => await OnInstanceListDoubleClickAsync(e);
+        _errorInstanceList = instancePanel.ErrorInstanceList;
+        _resolveCaptchaButton = instancePanel.ResolveCaptchaButton;
+        _instanceTabs.SelectedIndexChanged += (_, _) => UpdateManualActionButtons();
+        _instanceList.SelectedIndexChanged += (_, _) => OnInstanceSelected(_instanceList);
+        _instanceList.MouseDoubleClick += async (_, e) => await OnInstanceListDoubleClickAsync(_instanceList, e);
+        _errorInstanceList.SelectedIndexChanged += (_, _) => OnInstanceSelected(_errorInstanceList);
+        _errorInstanceList.MouseDoubleClick += async (_, e) => await OnInstanceListDoubleClickAsync(_errorInstanceList, e);
 
         _detailPanel = new InstanceDetailPanel();
         _detailPanel.ConfigChanged += OnDetailConfigChanged;
@@ -195,7 +218,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         _allProgressTimer.Dispose();
         _batchScheduler.Stop();
         _detailPanel.FlushToConfig();
-        StopAll();
+        StopAllForShutdown();
         foreach (var entry in _entries)
             _portAllocator.Release(entry.CdpPort);
         PersistSettings();
@@ -229,12 +252,14 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         _autoShopSheetLabel = toolbar.AutoShopSheetLabel;
         _runSelectedButton = toolbar.RunSelectedButton;
         _runSelectedButton.Click += async (_, _) => await StartSelectedAsync();
+        _runFailedButton = toolbar.RunFailedButton;
+        _runFailedButton.Click += async (_, _) => await StartFailedAsync();
         _startAutoButton = toolbar.StartAutoButton;
         _startAutoButton.Click += async (_, _) => await StartAutoRunAsync();
         _stopAutoButton = toolbar.StopAutoButton;
-        _stopAutoButton.Click += (_, _) => StopAutoRun();
+        _stopAutoButton.Click += async (_, _) => await StopAutoRunAsync();
         _stopAllButton = toolbar.StopAllButton;
-        _stopAllButton.Click += (_, _) => StopAll();
+        _stopAllButton.Click += async (_, _) => await StopAllAsync();
         _autoRunCheckBox = toolbar.AutoRunCheckBox;
         _autoRunCheckBox.CheckedChanged += (_, _) =>
         {
@@ -320,7 +345,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         return root;
     }
 
-    private BigSellerAccountConfig ActiveAccount =>
+    private AccountConfig ActiveAccount =>
         _settings.Accounts.FirstOrDefault(a => a.Id == _activeAccountId)
         ?? _settings.Accounts.First();
 
@@ -365,11 +390,13 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             return;
 
         _shopComboBox.Items.Clear();
+        // Placeholder buộc user chủ động chọn shop, tránh chạy nhầm shop.
+        _shopComboBox.Items.Add(new SelectorItem(ShopPlaceholderId, "- Chọn shop -"));
         foreach (var shop in ActiveAccount.Shops)
             _shopComboBox.Items.Add(new SelectorItem(shop.Id, shop.DisplayName));
 
-        var shopIndex = ActiveAccount.Shops.FindIndex(s => s.Id == _activeShopId);
-        _shopComboBox.SelectedIndex = Math.Max(0, shopIndex);
+        _shopComboBox.SelectedIndex = 0;
+        _shopChosenForRun = false;
         ActiveShop.UseSharedProfiles = true;
     }
 
@@ -404,7 +431,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
 
         SyncActiveShopSheetToVisibleInstances();
         RefreshAutoShopSheetLabel();
-        RefreshInstanceList();
+        RefreshInstanceList(preserveSelection: true);
         PersistSettings();
     }
 
@@ -413,13 +440,22 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         if (_suppressShopSelection || _shopComboBox?.SelectedItem is not SelectorItem item)
             return;
 
+        if (string.Equals(item.Id, ShopPlaceholderId, StringComparison.Ordinal))
+        {
+            // User về placeholder: coi như chưa chọn shop và chặn chạy.
+            _shopChosenForRun = false;
+            UpdateManualActionButtons();
+            return;
+        }
+
         _activeShopId = item.Id;
+        _shopChosenForRun = true;
         if (_workspaceAccountId is null)
             _settings.ActiveShopId = item.Id;
         ActiveShop.UseSharedProfiles = true;
         SyncActiveShopSheetToVisibleInstances();
         RefreshAutoShopSheetLabel();
-        RefreshInstanceList();
+        RefreshInstanceList(preserveSelection: true);
         PersistSettings();
     }
 
@@ -484,7 +520,6 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         {
             if (!string.IsNullOrWhiteSpace(shop.ShopeeDataSheet))
                 entry.Config.DataSheet = shop.ShopeeDataSheet.Trim();
-            entry.Config.BigSellerCookieFile = ActiveAccount.BigSellerCookieFile.Trim();
             entry.Session.ApplyConfig(entry.Config);
             RefreshListItem(entry.Config.Id);
         }
@@ -501,16 +536,15 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             config.ShopId = shop.Id;
         if (!string.IsNullOrWhiteSpace(shop.ShopeeDataSheet))
             config.DataSheet = shop.ShopeeDataSheet.Trim();
-        config.BigSellerCookieFile = ActiveAccount.BigSellerCookieFile.Trim();
         entry.Session.ApplyConfig(config);
     }
 
-    private bool SyncWorkspaceDefaultsToEntries()
+    private bool SyncWorkspaceDefaultsToEntries(bool syncSheet = true)
     {
         var changed = false;
         foreach (var entry in _entries)
         {
-            if (!ApplyAccountShopDefaultsToConfig(entry.Config))
+            if (!ApplyAccountShopDefaultsToConfig(entry.Config, syncSheet))
                 continue;
 
             changed = true;
@@ -521,11 +555,11 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         return changed;
     }
 
-    private bool ApplyAccountShopDefaultsToConfig(InstanceConfig config)
+    private bool ApplyAccountShopDefaultsToConfig(InstanceConfig config, bool syncSheet = true)
     {
         var changed = false;
         var shop = ResolveShop(config);
-        if (shop is not null)
+        if (syncSheet && shop is not null)
         {
             if (string.IsNullOrWhiteSpace(shop.ShopeeDataSheet) && !string.IsNullOrWhiteSpace(config.DataSheet))
             {
@@ -544,21 +578,10 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             }
         }
 
-        var account = ResolveAccount(config);
-        if (account is not null)
-        {
-            var cookieFile = account.BigSellerCookieFile.Trim();
-            if (!string.Equals(config.BigSellerCookieFile, cookieFile, StringComparison.Ordinal))
-            {
-                config.BigSellerCookieFile = cookieFile;
-                changed = true;
-            }
-        }
-
         return changed;
     }
 
-    private BigSellerAccountConfig? ResolveAccount(InstanceConfig config) =>
+    private AccountConfig? ResolveAccount(InstanceConfig config) =>
         _settings.Accounts.FirstOrDefault(a => a.Id == config.AccountId);
 
     private ShopConfig? ResolveShop(InstanceConfig config)
@@ -581,47 +604,14 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         AppendLog($"Import proxy: đã gán {proxyKeys.Count} key cho {targets.Count} profile trong shop.");
     }
 
-    private async Task ApplyBigSellerImportForActiveShopAsync(string cookieFile)
-    {
-        if (!File.Exists(cookieFile))
-        {
-            MessageBox.Show(this, "Không tìm thấy file cookie BigSeller.", "Import BigSeller",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        ActiveAccount.BigSellerCookieFile = cookieFile.Trim();
-        var targets = GetActiveShopEntries();
-        foreach (var entry in targets)
-        {
-            entry.Config.BigSellerCookieFile = cookieFile.Trim();
-            entry.Config.ExportBigSeller = true;
-            entry.Session.ApplyConfig(entry.Config);
-        }
-
-        var running = targets.Where(e => e.Session.IsRunning).ToList();
-        AppendLog($"Import BigSeller: áp dụng cookie cho {targets.Count} profile trong shop; {running.Count} profile đang mở sẽ import ngay.");
-        foreach (var entry in running)
-            await ImportBigSellerCookieIntoRunningProfileAsync(entry).ConfigureAwait(true);
-    }
-
-    private async Task ImportShopeeAccountsAsync(
+    private Task ImportShopeeAccountsAsync(
         List<string> accountLines,
         List<string>? proxyKeys = null,
         CancellationToken cancellationToken = default)
     {
-        var brave = GetBraveExe();
-        var userData = GetSourceUserData();
-        if (string.IsNullOrWhiteSpace(brave) || string.IsNullOrWhiteSpace(userData))
-        {
-            MessageBox.Show(this, "Cấu hình Brave exe và User Data mẫu trong Cài đặt chung.", "Import Shopee",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
         AppendLog(proxyKeys is { Count: > 0 }
-            ? $"Import Shopee: {accountLines.Count} profile, sẽ gán proxy trước khi đăng nhập."
-            : $"Import Shopee: {accountLines.Count} profile.");
+            ? $"Import Shopee: {accountLines.Count} profile — tạo instance và gán proxy (đăng nhập Shopee khi chạy)."
+            : $"Import Shopee: {accountLines.Count} profile — tạo instance (đăng nhập Shopee khi chạy).");
 
         var completed = 0;
         var skipped = 0;
@@ -633,7 +623,6 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             var line = accountLines[i].Trim();
             var username = line.Split('|', 2)[0].Trim();
 
-            // Tài khoản Shopee đã có trong list (cùng account) -> bỏ qua, không import trùng.
             if (!string.IsNullOrWhiteSpace(username) &&
                 _entries.Any(e => IsInActiveAccount(e) && string.Equals(
                     (e.Config.ShopeeAccountLogin ?? "").Split('|', 2)[0].Trim(),
@@ -652,80 +641,27 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             config.OpenWithShopeeAccount = true;
             config.CreateNewProfileOnNextStart = true;
             config.DataSheet = ActiveShop.ShopeeDataSheet.Trim();
-            config.BigSellerCookieFile = ActiveAccount.BigSellerCookieFile.Trim();
-            if (proxyKeys is { Count: > 0 })
-            {
-                config.KiotProxyKey = proxyKeys[i % proxyKeys.Count].Trim();
-                config.ManualProxy = "";
-            }
 
             AddInstanceCore(config, select: false);
             var entry = _entries.First(e => e.Config.Id == config.Id);
             entry.Session.ApplyConfig(config);
+            if (proxyKeys is { Count: > 0 })
+                ShopeeImportService.ApplyProxyImport([entry], proxyKeys, RefreshListItem, startIndex: i);
             RefreshListItem(config.Id);
 
             _statusStripLabel.Text = $"Import Shopee {i + 1}/{accountLines.Count}: {config.DisplayName}";
 
-            // Chưa có proxy → chỉ tạo sẵn instance; lần chạy đầu (khi có proxy) sẽ tự đăng nhập.
-            if (string.IsNullOrWhiteSpace(config.KiotProxyKey) && string.IsNullOrWhiteSpace(config.ManualProxy))
-            {
-                AppendLog($"[{config.DisplayName}] Import Shopee: tạo sẵn instance (chưa có proxy — đánh dấu cần login bằng Shopee account ở lần chạy đầu tiên).");
-                entry.Session.ApplyConfig(config);
-                RefreshListItem(config.Id);
-                PersistSettings();
-                completed++;
-                continue;
-            }
-
             var proxyNote = proxyKeys is { Count: > 0 } ? $" | proxy #{(i % proxyKeys.Count) + 1}" : "";
-            AppendLog($"[{config.DisplayName}] Import Shopee: mở profile và đăng nhập ({i + 1}/{accountLines.Count}){proxyNote}.");
-            var loggedInDuringImport = false;
-
-            try
-            {
-                await entry.Session.StartAsync(brave, userData).ConfigureAwait(true);
-                await entry.Session.OpenShopeeAccountLoginAsync().ConfigureAwait(true);
-                AppendLog($"[{config.DisplayName}] Import Shopee: chờ 15s trước khi đóng profile.");
-                await Task.Delay(15_000, cancellationToken).ConfigureAwait(true);
-                config.OpenWithShopeeAccount = false;
-                config.CreateNewProfileOnNextStart = false;
-                loggedInDuringImport = true;
-                completed++;
-            }
-            catch (OperationCanceledException)
-            {
-                AppendLog($"[{config.DisplayName}] Import Shopee: dừng sớm theo lệnh người dùng.");
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[{config.DisplayName}] Import Shopee lỗi: {ex.Message}");
-                AppendLog($"[{config.DisplayName}] Giữ trạng thái cần login trước; lần chạy sau sẽ mở bằng Shopee account đã import.");
-                completed++;
-            }
-            finally
-            {
-                try
-                {
-                    if (entry.Session.IsRunning)
-                        await entry.Session.StopAsync(CancellationToken.None).ConfigureAwait(true);
-                }
-                catch (Exception ex)
-                {
-                    AppendLog($"[{config.DisplayName}] Đóng profile lỗi: {ex.Message}");
-                }
-
-                if (!loggedInDuringImport)
-                    config.OpenWithShopeeAccount = true;
-                entry.Session.ApplyConfig(config);
-                RefreshListItem(config.Id);
-                PersistSettings();
-            }
+            AppendLog($"[{config.DisplayName}] Import Shopee: đã tạo instance{proxyNote} — login Shopee khi chạy lần đầu.");
+            PersistSettings();
+            completed++;
         }
 
         var skipNote = skipped > 0 ? $" (bỏ qua {skipped} đã có)" : "";
         AppendLog(cancellationToken.IsCancellationRequested
             ? $"Import Shopee: đã dừng sau {completed}/{accountLines.Count} profile{skipNote}."
             : $"Import Shopee: hoàn tất {accountLines.Count - skipped} profile{skipNote}.");
+        return Task.CompletedTask;
     }
 
     private void RemoveEntries(List<InstanceEntry> entries)
@@ -745,29 +681,141 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         return entry.Config.AccountId == ActiveAccount.Id;
     }
 
-    private void RefreshInstanceList()
+    private static bool IsErrorListEntry(InstanceEntry entry) => IsErrorListConfig(entry.Config);
+
+    private static bool IsErrorListConfig(InstanceConfig config) =>
+        config.CaptchaError;
+
+    private ListView GetListForEntry(InstanceEntry entry) =>
+        IsErrorListEntry(entry) ? _errorInstanceList : _instanceList;
+
+    private IEnumerable<ListView> InstanceLists()
     {
+        yield return _instanceList;
+        yield return _errorInstanceList;
+    }
+
+    private IEnumerable<ListViewItem> SelectedInstanceItems() =>
+        InstanceLists().SelectMany(list => list.SelectedItems.Cast<ListViewItem>());
+
+    private ListView GetCurrentSelectionList() =>
+        _instanceList.SelectedItems.Count > 0 ? _instanceList :
+        _errorInstanceList.SelectedItems.Count > 0 ? _errorInstanceList :
+        CurrentInstanceList;
+
+    private static void UpdateListItem(ListViewItem item, InstanceEntry entry)
+    {
+        item.SubItems[1].Text = entry.Config.DisplayName;
+        item.SubItems[2].Text = entry.Session.StatusText;
+        item.SubItems[3].Text = TruncateProgress(entry.Config.ProgressSummary);
+        item.SubItems[4].Text = TruncateProxy(entry.Session.ProxySummary);
+    }
+
+    private ListViewItem? FindListItem(string id, out ListView? owner)
+    {
+        foreach (var list in InstanceLists())
+        {
+            foreach (ListViewItem item in list.Items)
+            {
+                if (item.Tag as string != id) continue;
+                owner = list;
+                return item;
+            }
+        }
+
+        owner = null;
+        return null;
+    }
+
+    private void RenumberInstanceList(ListView list)
+    {
+        for (var i = 0; i < list.Items.Count; i++)
+            list.Items[i].Text = (i + 1).ToString();
+    }
+
+    private void RenumberInstanceLists()
+    {
+        RenumberInstanceList(_instanceList);
+        RenumberInstanceList(_errorInstanceList);
+        UpdateInstanceTabTitles();
+    }
+
+    private void UpdateInstanceTabTitles()
+    {
+        // Hiện số profile trên mỗi tab, vd "Normal (20)" / "Error (10)". Tab owner-drawn nên chỉ cần đổi
+        // Text rồi Invalidate để vẽ lại.
+        _instanceTabs.TabPages[0].Text = $"Normal ({_instanceList.Items.Count})";
+        _instanceTabs.TabPages[1].Text = $"Error ({_errorInstanceList.Items.Count})";
+        _instanceTabs.Invalidate();
+    }
+
+    private bool SelectFirstVisibleInstance()
+    {
+        var list = _instanceList.Items.Count > 0 ? _instanceList :
+            _errorInstanceList.Items.Count > 0 ? _errorInstanceList : null;
+        if (list is null)
+            return false;
+
+        _instanceTabs.SelectedTab = list == _errorInstanceList
+            ? _instanceTabs.TabPages[1]
+            : _instanceTabs.TabPages[0];
+        _suppressInstanceSelection = true;
+        try
+        {
+            list.Items[0].Selected = true;
+            list.Items[0].Focused = true;
+            list.Select();
+        }
+        finally
+        {
+            _suppressInstanceSelection = false;
+        }
+        return true;
+    }
+
+    private void RefreshInstanceList(bool preserveSelection = false)
+    {
+        var previousSelectedId = preserveSelection ? _selected?.Config.Id : null;
+        var previousTabIsError = preserveSelection && _instanceTabs.SelectedTab == _instanceTabs.TabPages[1];
         _detailPanel.FlushToConfig();
         _suppressInstanceSelection = true;
         _instanceList.BeginUpdate();
+        _errorInstanceList.BeginUpdate();
         try
         {
             _instanceList.Items.Clear();
+            _errorInstanceList.Items.Clear();
             foreach (var entry in _entries.Where(IsVisibleInActiveShop))
-                _instanceList.Items.Add(CreateListItem(entry));
+                GetListForEntry(entry).Items.Add(CreateListItem(entry));
+            RenumberInstanceLists();
         }
         finally
         {
             _instanceList.EndUpdate();
+            _errorInstanceList.EndUpdate();
             _suppressInstanceSelection = false;
         }
 
         _selected = null;
-        if (_instanceList.Items.Count > 0)
+        if (preserveSelection &&
+            previousSelectedId is not null &&
+            TrySelectInstance(previousSelectedId))
         {
-            _instanceList.Items[0].Selected = true;
-            _instanceList.Items[0].Focused = true;
-            OnInstanceSelected();
+            OnInstanceSelected(GetCurrentSelectionList());
+        }
+        else if (preserveSelection &&
+                 previousTabIsError &&
+                 _errorInstanceList.Items.Count > 0)
+        {
+            _instanceTabs.SelectedTab = _instanceTabs.TabPages[1];
+            _errorInstanceList.Items[0].Selected = true;
+            _errorInstanceList.Items[0].Focused = true;
+            _errorInstanceList.Select();
+            OnInstanceSelected(_errorInstanceList);
+        }
+        else if (SelectFirstVisibleInstance())
+        {
+            OnInstanceSelected(GetCurrentSelectionList());
         }
         else
         {
@@ -776,9 +824,35 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         UpdateManualActionButtons();
     }
 
+    private bool TrySelectInstance(string id)
+    {
+        var item = FindListItem(id, out var owner);
+        if (item is null || owner is null)
+            return false;
+
+        _instanceTabs.SelectedTab = owner == _errorInstanceList
+            ? _instanceTabs.TabPages[1]
+            : _instanceTabs.TabPages[0];
+        _suppressInstanceSelection = true;
+        try
+        {
+            item.Selected = true;
+            item.Focused = true;
+            owner.FocusedItem = item;
+            owner.Select();
+        }
+        finally
+        {
+            _suppressInstanceSelection = false;
+        }
+        return true;
+    }
+
     private static ListViewItem CreateListItem(InstanceEntry entry)
     {
-        var item = new ListViewItem(entry.Config.DisplayName);
+        // Cột 0 = số thứ tự (điền bởi RenumberInstanceList). Cột 1 trở đi = Tên, Trạng thái, Tiến độ, Proxy.
+        var item = new ListViewItem("");
+        item.SubItems.Add(entry.Config.DisplayName);
         item.SubItems.Add(entry.Session.StatusText);
         item.SubItems.Add(TruncateProgress(entry.Config.ProgressSummary));
         item.SubItems.Add(entry.Session.ProxySummary);
@@ -793,38 +867,67 @@ internal sealed class ShopeeWorkspaceControl : UserControl
 
     private void ApplySplitLayout()
     {
-        var outerWidth = _actionSplit.ClientSize.Width;
-        if (outerWidth >= 720)
-        {
-            var actionWidth = Math.Clamp(210, _actionSplit.Panel1MinSize, outerWidth - _actionSplit.Panel2MinSize - _actionSplit.SplitterWidth);
-            try { _actionSplit.SplitterDistance = actionWidth; }
-            catch { /* bỏ qua */ }
-        }
+        ApplySplitDistanceSafely(_actionSplit, preferredLeft: 190, preferredRight: 980, narrowLeft: 90, narrowRight: 160);
+        ApplySplitDistanceSafely(_split, preferredLeft: 460, preferredRight: 560, narrowLeft: 120, narrowRight: 240, preferredRatio: 0.44);
+    }
 
-        var w = _split.ClientSize.Width;
-        if (w < 120) return;
-        const int minLeft = 300;
-        const int minRight = 360;
-        var maxLeft = w - minRight - _split.SplitterWidth;
-        if (maxLeft < minLeft)
-        {
-            // Cửa sổ hẹp: không ép min size SplitContainer (tránh crash lúc khởi động)
-            try { _split.SplitterDistance = Math.Max(80, w / 3); }
-            catch { /* bỏ qua */ }
+    private static void ApplySplitDistanceSafely(
+        SplitContainer split,
+        int preferredLeft,
+        int preferredRight,
+        int narrowLeft,
+        int narrowRight,
+        double preferredRatio = 0)
+    {
+        if (!split.IsHandleCreated || split.IsDisposed)
             return;
-        }
 
-        var left = (int)(w * 0.34);
-        left = Math.Clamp(left, minLeft, maxLeft);
+        var width = split.ClientSize.Width;
+        if (width <= split.SplitterWidth + 20)
+            return;
+
+        var enoughRoom = width >= preferredLeft + preferredRight + split.SplitterWidth;
+        var targetLeft = enoughRoom ? preferredLeft : Math.Min(narrowLeft, Math.Max(1, width / 3));
+        var targetRight = enoughRoom ? preferredRight : Math.Min(narrowRight, Math.Max(1, width / 3));
+
+        var safeMin = Math.Max(1, Math.Min(25, (width - split.SplitterWidth) / 3));
         try
         {
-            if (Math.Abs(_split.SplitterDistance - left) > 2)
-                _split.SplitterDistance = left;
+            split.Panel1MinSize = safeMin;
+            split.Panel2MinSize = safeMin;
         }
         catch
         {
-            try { _split.SplitterDistance = minLeft; }
-            catch { /* bỏ qua */ }
+            return;
+        }
+
+        var minDistance = Math.Max(split.Panel1MinSize, targetLeft);
+        var maxDistance = width - Math.Max(split.Panel2MinSize, targetRight) - split.SplitterWidth;
+        if (maxDistance < minDistance)
+        {
+            minDistance = split.Panel1MinSize;
+            maxDistance = width - split.Panel2MinSize - split.SplitterWidth;
+        }
+
+        if (maxDistance < minDistance)
+            return;
+        var currentDistance = Math.Clamp(split.SplitterDistance, split.Panel1MinSize, width - split.Panel2MinSize - split.SplitterWidth);
+
+        var desired = preferredRatio > 0
+            ? (int)(width * preferredRatio)
+            : preferredLeft;
+        var distance = Math.Clamp(desired, minDistance, maxDistance);
+
+        try
+        {
+            if (split.SplitterDistance != currentDistance)
+                split.SplitterDistance = currentDistance;
+            if (Math.Abs(split.SplitterDistance - distance) > 2)
+                split.SplitterDistance = distance;
+        }
+        catch
+        {
+            // Layout may fire while the handle is still settling; next resize/load will retry.
         }
     }
 
@@ -896,22 +999,51 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         if (_startAutoButton is null || _stopAutoButton is null) return;
 
         var auto = _settings.AutoRunEnabled;
+        var hasAutoRunningWork = HasRunningAutoWork();
         _startAutoButton.Visible = true;
         _stopAutoButton.Visible = true;
-        _startAutoButton.Enabled = auto && !_batchScheduler.IsActive;
-        _stopAutoButton.Enabled = auto && _batchScheduler.IsActive;
+        _startAutoButton.Enabled = auto && !_batchScheduler.IsActive && !hasAutoRunningWork;
+        _stopAutoButton.Enabled = auto && (_batchScheduler.IsActive || hasAutoRunningWork);
         UpdateManualActionButtons();
         UpdateAutoConfigControlsEnabled(auto);
     }
+
+    private bool HasRunningAutoWork() =>
+        _entries.Any(e =>
+            IsInAutoRunRange(e) &&
+            (e.Session.IsRunnerLoopActive ||
+             e.Session.IsRunnerLoopPending ||
+             e.Session.IsRunning ||
+             e.Session.IsBusy));
 
     private void UpdateManualActionButtons()
     {
         var auto = _settings.AutoRunEnabled;
         if (_runSelectedButton is not null)
-            _runSelectedButton.Enabled = !auto && _instanceList.SelectedItems.Count > 0;
+            _runSelectedButton.Enabled = !auto && CurrentInstanceList.SelectedItems.Count > 0;
+        if (_runFailedButton is not null)
+        {
+            var failedCount = GetRunnableFailedEntries().Count;
+            _runFailedButton.Visible = failedCount > 0;
+            _runFailedButton.Enabled = !auto && failedCount > 0;
+            _runFailedButton.Text = failedCount > 0
+                ? $"Chạy {failedCount} profile lỗi"
+                : "Chạy profile lỗi";
+        }
+        if (_resolveCaptchaButton is not null)
+        {
+            var canResolve = !auto && GetCaptchaResolveSelection().Count > 0;
+            _resolveCaptchaButton.Enabled = canResolve;
+            _resolveCaptchaButton.Visible = canResolve;
+        }
         if (_stopAllButton is not null)
         {
-            var hasRunningInActiveAccount = _entries.Any(e => IsInActiveAccount(e) && e.Session.IsRunning);
+            var hasRunningInActiveAccount = _entries.Any(e =>
+                IsInActiveAccount(e) &&
+                (e.Session.IsRunning ||
+                 e.Session.IsBusy ||
+                 e.Session.IsRunnerLoopActive ||
+                 e.Session.IsRunnerLoopPending));
             _stopAllButton.Visible = hasRunningInActiveAccount;
             _stopAllButton.Enabled = !auto && hasRunningInActiveAccount;
         }
@@ -1088,9 +1220,39 @@ internal sealed class ShopeeWorkspaceControl : UserControl
                 try
                 {
                     var endedEntry = _entries.FirstOrDefault(e => e.Config.Id == instanceId);
-                    if (endedEntry is not null && IsCaptchaPaused(endedEntry.Config))
+
+                    // Đang relaunch+resume (watchdog/proxy mở lại profile rồi chạy tiếp) → KHÔNG coi là kết
+                    // thúc thật: GIỮ slot, không dispatch profile mới (tránh vượt Max do runner cũ chạy lại
+                    // mà slot đã bị nhả). Khi runner thực sự xong sẽ có RunnerLoopEnded khác (resuming=false).
+                    if (endedEntry is not null && endedEntry.Session.IsRunnerResuming)
                     {
-                        await HandleCaptchaHandoffAsync(endedEntry).ConfigureAwait(true);
+                        RefreshListItem(instanceId);
+                        return;
+                    }
+
+                    if (endedEntry is not null && IsCaptchaBlocked(endedEntry.Config))
+                    {
+                        await HandleCaptchaHandoffAsync(endedEntry, "captcha").ConfigureAwait(true);
+                        return;
+                    }
+
+                    if (endedEntry is not null && IsProxyPaused(endedEntry.Config))
+                    {
+                        await HandleCaptchaHandoffAsync(endedEntry, "proxy").ConfigureAwait(true);
+                        return;
+                    }
+
+                    // Hết dữ liệu (range vượt cuối sheet) → DỪNG AUTO, không mở thêm instance nào nữa.
+                    // Các range tăng dần theo profile nên một khi rỗng thì mọi profile sau cũng rỗng.
+                    if (endedEntry is not null && _batchScheduler.IsActive && IsNoDataError(endedEntry.Config))
+                    {
+                        _batchScheduler.Stop();
+                        endedEntry.Config.RunnerRunning = false;
+                        RefreshListItem(instanceId);
+                        PersistSettings();
+                        AppendLog($"[{endedEntry.Config.DisplayName}] Hết dữ liệu (không có link hợp lệ) — DỪNG auto, không mở thêm instance. Các instance đang chạy vẫn chạy nốt.");
+                        UpdateBatchStatusLabel();
+                        UpdateAutoToolbarButtons();
                         return;
                     }
 
@@ -1115,9 +1277,13 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         if (IsVisibleInActiveShop(entry))
         {
             var item = CreateListItem(entry);
-            _instanceList.Items.Add(item);
+            GetListForEntry(entry).Items.Add(item);
+            RenumberInstanceLists();
             if (select)
             {
+                _instanceTabs.SelectedTab = item.ListView == _errorInstanceList
+                    ? _instanceTabs.TabPages[1]
+                    : _instanceTabs.TabPages[0];
                 item.Selected = true;
                 item.Focused = true;
             }
@@ -1132,15 +1298,15 @@ internal sealed class ShopeeWorkspaceControl : UserControl
     {
         _detailPanel.FlushToConfig();
 
-        if (_instanceList.SelectedItems.Count == 0)
+        var selectedItems = SelectedInstanceItems().ToList();
+        if (selectedItems.Count == 0)
         {
             MessageBox.Show(this, "Chọn một hoặc nhiều instance cần xóa (Ctrl/Shift + click).",
                 "Xóa", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        var ids = _instanceList.SelectedItems
-            .Cast<ListViewItem>()
+        var ids = selectedItems
             .Select(i => i.Tag as string)
             .Where(id => !string.IsNullOrEmpty(id))
             .Cast<string>()
@@ -1166,17 +1332,16 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             _entries.Remove(entry);
         }
 
-        foreach (ListViewItem item in _instanceList.Items.Cast<ListViewItem>()
-                     .Where(i => i.Tag is string id && ids.Contains(id)).ToList())
-            _instanceList.Items.Remove(item);
+        foreach (var list in InstanceLists())
+        {
+            foreach (ListViewItem item in list.Items.Cast<ListViewItem>()
+                         .Where(i => i.Tag is string id && ids.Contains(id)).ToList())
+                list.Items.Remove(item);
+        }
+        RenumberInstanceLists();
 
         _selected = null;
-        if (_instanceList.Items.Count > 0)
-        {
-            _instanceList.Items[0].Selected = true;
-            OnInstanceSelected();
-        }
-        else
+        if (!SelectFirstVisibleInstance())
         {
             BindDetailPanel(null);
         }
@@ -1187,8 +1352,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
 
     private List<InstanceEntry> GetSelectedEntries()
     {
-        var ids = _instanceList.SelectedItems
-            .Cast<ListViewItem>()
+        var ids = SelectedInstanceItems()
             .Select(i => i.Tag as string)
             .Where(id => !string.IsNullOrEmpty(id))
             .Cast<string>()
@@ -1198,18 +1362,70 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         return _entries.Where(e => ids.Contains(e.Config.Id)).ToList();
     }
 
-    private async Task OnInstanceListDoubleClickAsync(MouseEventArgs e)
+    private List<InstanceEntry> GetCaptchaResolveSelection()
     {
-        var item = _instanceList.GetItemAt(e.X, e.Y);
+        if (_instanceTabs.SelectedTab != _instanceTabs.TabPages[1])
+            return [];
+
+        var ids = _errorInstanceList.SelectedItems
+            .Cast<ListViewItem>()
+            .Select(i => i.Tag as string)
+            .Where(id => !string.IsNullOrEmpty(id))
+            .Cast<string>()
+            .Distinct()
+            .ToHashSet(StringComparer.Ordinal);
+
+        return _entries.Where(e => ids.Contains(e.Config.Id) && e.Config.CaptchaError).ToList();
+    }
+
+    private void ResolveSelectedCaptcha()
+    {
+        var targets = GetCaptchaResolveSelection();
+        if (targets.Count == 0)
+        {
+            MessageBox.Show(this, "Chọn profile captcha trong tab Error để chuyển về Normal.",
+                "Đã giải captcha", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        foreach (var entry in targets)
+        {
+            entry.Config.CaptchaError = false;
+            entry.Config.RunnerPhase = null;
+            entry.Config.LastRunnerMessage = null;
+            RefreshListItem(entry.Config.Id);
+        }
+
+        RefreshInstanceList(preserveSelection: true);
+        UpdateManualActionButtons();
+        PersistSettings();
+    }
+
+    private async Task OnInstanceListDoubleClickAsync(ListView list, MouseEventArgs e)
+    {
+        var item = list.GetItemAt(e.X, e.Y);
         if (item is null)
             return;
 
-        _instanceList.SelectedItems.Clear();
+        foreach (ListViewItem selected in list.SelectedItems.Cast<ListViewItem>().ToList())
+            selected.Selected = false;
         item.Selected = true;
         item.Focused = true;
-        _instanceList.FocusedItem = item;
-        OnInstanceSelected();
+        list.FocusedItem = item;
+        _instanceTabs.SelectedTab = list == _errorInstanceList ? _instanceTabs.TabPages[1] : _instanceTabs.TabPages[0];
+        OnInstanceSelected(list);
         await StartSelectedAsync().ConfigureAwait(true);
+    }
+
+    /// <summary>Buộc đã chọn shop (combo) trước khi chạy — tránh chạy nhầm shop.</summary>
+    private bool EnsureShopChosen()
+    {
+        if (_shopChosenForRun)
+            return true;
+        MessageBox.Show(this,
+            "Cần chọn Shop trước khi chạy.\n\nChọn đúng shop ở ô \"Shop\" (góc trên bên trái) rồi chạy lại.",
+            "Chọn shop", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        return false;
     }
 
     private async Task StartSelectedAsync()
@@ -1222,6 +1438,9 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             return;
         }
 
+        if (!EnsureShopChosen())
+            return;
+
         _detailPanel.FlushToConfig();
 
         var selected = GetSelectedEntries();
@@ -1232,18 +1451,61 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             return;
         }
 
+        await RunEntriesManuallyAsync(selected, "Chạy đã chọn").ConfigureAwait(true);
+    }
+
+    /// <summary>Chạy lại các profile đang bị lỗi (captcha/proxy) — nút chỉ hiện khi có profile lỗi.</summary>
+    private async Task StartFailedAsync()
+    {
+        if (_settings.AutoRunEnabled)
+        {
+            MessageBox.Show(this,
+                "Đang bật chế độ auto — tắt auto rồi chạy lại profile lỗi thủ công.",
+                "Chạy profile lỗi", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!EnsureShopChosen())
+            return;
+
+        _detailPanel.FlushToConfig();
+
+        var failed = GetRunnableFailedEntries();
+        if (failed.Count == 0)
+        {
+            MessageBox.Show(this, "Không có profile lỗi nào để chạy lại.",
+                "Chạy profile lỗi", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        await RunEntriesManuallyAsync(failed, "Chạy profile lỗi").ConfigureAwait(true);
+    }
+
+    /// <summary>Profile đang ở trạng thái lỗi (captcha/proxy/error) và đang rảnh để chạy lại được.</summary>
+    private List<InstanceEntry> GetRunnableFailedEntries() =>
+        _entries.Where(e =>
+            IsVisibleInActiveShop(e) &&
+            e.Config.CaptchaError &&
+            !e.Session.IsRunning &&
+            !e.Session.IsBusy &&
+            !e.Session.IsRunnerLoopActive &&
+            !e.Session.IsRunnerLoopPending)
+        .ToList();
+
+    private async Task RunEntriesManuallyAsync(List<InstanceEntry> targets, string actionLabel)
+    {
         var brave = GetBraveExe();
         var userData = GetSourceUserData();
         if (string.IsNullOrWhiteSpace(brave) || string.IsNullOrWhiteSpace(userData))
         {
             MessageBox.Show(this, "Cấu hình Brave exe và User Data mẫu trong Cài đặt chung.",
-                "Chạy đã chọn", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                actionLabel, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
         var ready = new List<(InstanceEntry Entry, int RunRow)>();
         var skipped = new List<string>();
-        foreach (var entry in selected)
+        foreach (var entry in targets)
         {
             ApplyShopSheetToEntry(entry);
             var c = entry.Config;
@@ -1272,22 +1534,15 @@ internal sealed class ShopeeWorkspaceControl : UserControl
                 continue;
             }
 
-            // Chưa có proxy: cảnh báo + cho bấm OK để vẫn mở (login Shopee bằng IP máy) thay vì chặn cứng.
-            if (c.RequireProxy &&
-                !entry.Session.NoProxyAllowed &&
-                string.IsNullOrWhiteSpace(c.KiotProxyKey) &&
-                string.IsNullOrWhiteSpace(c.ManualProxy))
+            if (!ProxyLaunchGuard.ConfirmOrAllow(
+                    c,
+                    entry.Session,
+                    this,
+                    dialogTitle: actionLabel,
+                    messagePrefix: c.DisplayName))
             {
-                var answer = MessageBox.Show(this,
-                    $"{c.DisplayName}: chưa có proxy (KiotProxy key / proxy thủ công).\n\n"
-                    + "Vẫn mở? Shopee sẽ đăng nhập bằng IP máy — tài khoản có thể bị nghi ngờ.",
-                    "Chạy đã chọn", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
-                if (answer != DialogResult.OK)
-                {
-                    skipped.Add($"{c.DisplayName}: bỏ qua (chưa có proxy)");
-                    continue;
-                }
-                entry.Session.AllowNoProxyForSession();
+                skipped.Add($"{c.DisplayName}: bỏ qua (chưa có proxy)");
+                continue;
             }
 
             c.NextRunRow = runRow;
@@ -1298,11 +1553,12 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         {
             MessageBox.Show(this,
                 "Không có instance nào sẵn sàng để chạy.\n\n" + string.Join("\n", skipped),
-                "Chạy đã chọn", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                actionLabel, MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        _runSelectedButton!.Enabled = false;
+        if (_runSelectedButton is not null) _runSelectedButton.Enabled = false;
+        if (_runFailedButton is not null) _runFailedButton.Enabled = false;
         try
         {
             var index = 0;
@@ -1310,12 +1566,11 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             {
                 index++;
                 var c = entry.Config;
-                _statusStripLabel.Text = $"Chạy đã chọn {index}/{ready.Count}: {c.DisplayName}";
-                AppendLog($"[{c.DisplayName}] Chạy đã chọn — mở profile & chạy sheet \"{c.DataSheet}\" từ dòng {runRow} (phạm vi {c.StartRow}–{c.EndRow?.ToString() ?? "hết"})…");
-                AppendInstanceLog(c, $"Chạy đã chọn — từ dòng {runRow} (sheet \"{c.DataSheet}\")…", selectTab: index == 1);
+                _statusStripLabel.Text = $"{actionLabel} {index}/{ready.Count}: {c.DisplayName}";
+                AppendLog($"[{c.DisplayName}] {actionLabel} — mở profile & chạy sheet \"{c.DataSheet}\" từ dòng {runRow} (phạm vi {c.StartRow}–{c.EndRow?.ToString() ?? "hết"})…");
+                AppendInstanceLog(c, $"{actionLabel} — từ dòng {runRow} (sheet \"{c.DataSheet}\")…", selectTab: index == 1);
 
-                entry.Session.ApplyConfig(c);
-                await RunManualWithExtensionRetryAsync(entry, brave, userData, preferSuggestedResume: true)
+                await StartInstanceRunnerAsync(entry, brave, userData, preferSuggestedResume: true)
                     .ConfigureAwait(true);
 
                 for (var wait = 0; wait < 90 && !entry.Session.IsRunnerLoopPending; wait++)
@@ -1328,9 +1583,9 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             }
 
             if (skipped.Count > 0)
-                AppendLog("Chạy đã chọn — bỏ qua: " + string.Join("; ", skipped));
+                AppendLog($"{actionLabel} — bỏ qua: " + string.Join("; ", skipped));
 
-            _statusStripLabel.Text = $"Đã kích hoạt {ready.Count}/{selected.Count} instance đã chọn";
+            _statusStripLabel.Text = $"Đã kích hoạt {ready.Count}/{targets.Count} instance ({actionLabel})";
         }
         finally
         {
@@ -1338,12 +1593,44 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         }
     }
 
-    private void StopAll()
+    private async Task StopAllAsync()
+    {
+        _batchScheduler.Stop();
+        var targets = _entries
+            .Where(e => IsInActiveAccount(e) &&
+                        (e.Session.IsRunnerLoopActive ||
+                         e.Session.IsRunnerLoopPending ||
+                         e.Session.IsRunning ||
+                         e.Session.IsBusy))
+            .ToList();
+
+        _statusStripLabel.Text = targets.Count > 0 ? "Đang dừng tất cả..." : "Đã dừng tất cả";
+        foreach (var entry in targets)
+        {
+            try
+            {
+                await StopInstanceWorkAsync(entry).ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[{entry.Config.DisplayName}] Dừng tất cả lỗi: {ex.Message}");
+            }
+
+            RefreshListItem(entry.Config.Id);
+            UpdateManualActionButtons();
+        }
+
+        _statusStripLabel.Text = "Đã dừng tất cả";
+        NotifyRunningStateChanged();
+        PersistSettings();
+    }
+
+    private void StopAllForShutdown()
     {
         _batchScheduler.Stop();
         foreach (var entry in _entries.Where(IsInActiveAccount))
         {
-            if (entry.Session.IsRunning)
+            if (entry.Session.IsRunning || entry.Session.IsRunnerLoopActive || entry.Session.IsRunnerLoopPending)
                 entry.Session.Stop();
             RefreshListItem(entry.Config.Id);
             UpdateManualActionButtons();
@@ -1362,13 +1649,16 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             return;
         }
 
+        if (!EnsureShopChosen())
+            return;
+
         await StartBatchRunAsync().ConfigureAwait(true);
         UpdateAutoToolbarButtons();
     }
 
-    private void StopAutoRun()
+    private async Task StopAutoRunAsync()
     {
-        StopBatchRun();
+        await StopBatchRunAsync().ConfigureAwait(true);
         UpdateAutoToolbarButtons();
         NotifyRunningStateChanged();
     }
@@ -1419,6 +1709,9 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             return;
         }
 
+        _batchPlannedIds.Clear();
+        _batchPlannedIds.AddRange(eligible.Select(e => e.Config.Id));
+
         _batchScheduler.Start();
         NotifyRunningStateChanged();
         AppendLog($"Chạy tự động: {eligible.Count} profile ({rangeLabel}), tối đa {max} đồng thời.");
@@ -1453,7 +1746,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
                 try
                 {
                     entry.Session.ApplyConfig(entry.Config);
-                    await entry.Session.StopRunnerAsync().ConfigureAwait(true);
+                    await StopInstanceWorkAsync(entry).ConfigureAwait(true);
                     AppendLog($"[{entry.Config.DisplayName}] Đã dừng runner (lượt cũ).");
                 }
                 catch (Exception ex)
@@ -1466,7 +1759,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             {
                 try
                 {
-                    await entry.Session.StopAsync(CancellationToken.None).ConfigureAwait(true);
+                    await StopInstanceWorkAsync(entry).ConfigureAwait(true);
                     AppendLog($"[{entry.Config.DisplayName}] Đóng profile (ngoài phạm vi {rangeFrom}–{(rangeTo >= _entries.Count ? "hết" : rangeTo)}).");
                 }
                 catch (Exception ex)
@@ -1488,9 +1781,18 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         PersistSettings();
     }
 
-    private void StopBatchRun()
+    private async Task StopBatchRunAsync()
     {
-        if (!_batchScheduler.IsActive)
+        var dispatched = _batchScheduler.GetDispatchedSnapshot();
+        var targets = _entries
+            .Where(e => (dispatched.Contains(e.Config.Id) || IsInAutoRunRange(e)) &&
+                        (e.Session.IsRunnerLoopActive ||
+                         e.Session.IsRunnerLoopPending ||
+                         e.Session.IsRunning ||
+                         e.Session.IsBusy))
+            .ToList();
+
+        if (!_batchScheduler.IsActive && targets.Count == 0)
         {
             MessageBox.Show(this, "Auto chưa chạy.", Text,
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1498,10 +1800,32 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         }
 
         _batchScheduler.Stop();
-        AppendLog("Đã dừng auto — profile đang chạy vẫn tiếp tục, không tự bật profile mới.");
-        _statusStripLabel.Text = "Đã dừng auto";
+        _statusStripLabel.Text = targets.Count > 0 ? "Đang dừng auto..." : "Đã dừng auto";
+        AppendLog(targets.Count > 0
+            ? $"Dừng auto — đang dừng {targets.Count} profile đã chạy trong lượt auto..."
+            : "Đã dừng auto.");
+
+        foreach (var entry in targets)
+        {
+            try
+            {
+                await StopInstanceWorkAsync(entry).ConfigureAwait(true);
+                AppendLog($"[{entry.Config.DisplayName}] Đã dừng do dừng auto.");
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[{entry.Config.DisplayName}] Dừng auto lỗi: {ex.Message}");
+            }
+
+            RefreshListItem(entry.Config.Id);
+        }
+
+        _statusStripLabel.Text = targets.Count > 0
+            ? $"Đã dừng auto ({targets.Count} profile)"
+            : "Đã dừng auto";
         UpdateAutoToolbarButtons();
         NotifyRunningStateChanged();
+        PersistSettings();
     }
 
     private (int from, int to) GetAutoRunRange()
@@ -1519,299 +1843,107 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         IsVisibleInActiveShop(entry) &&
         IsInAutoRunRange(entry) &&
         IsBatchConfigured(entry) &&
+        // Profile đang ở tab Error (dính captcha) → auto KHÔNG đụng tới; chờ user xử lý + bấm "Đã giải captcha".
+        !entry.Config.CaptchaError &&
         !entry.Session.IsRunnerLoopActive;
 
-    private static bool IsCaptchaPaused(InstanceConfig config) =>
-        string.Equals(config.RunnerPhase, "paused", StringComparison.OrdinalIgnoreCase) &&
-        (config.LastRunnerMessage?.Contains("captcha", StringComparison.OrdinalIgnoreCase) == true);
+    // Phát hiện instance bị captcha chặn để quyết định handoff (đóng profile lỗi, chuyển instance kế).
+    // Captcha dừng instance ở nhiều phase:
+    //  - "paused": dừng tại chỗ khi scrape (LauncherRunnerLoop) hoặc handoff (HandleCaptchaHandoffAsync).
+    //  - "error" : captcha/OTP lúc login → EnsureShopeeLoggedInAsync throw → bị bắt ở catch chung và
+    //              set phase="error" (xem BraveInstanceSession). Phải bắt cả phase này, nếu không ca
+    //              login-captcha sẽ KHÔNG kích hoạt handoff. (Việc xếp tab Error dựa vào cờ CaptchaError,
+    //              chỉ bật ở phiên auto — xem HandleCaptchaHandoffAsync.)
+    private static bool IsCaptchaBlocked(InstanceConfig config) =>
+        (config.LastRunnerMessage?.Contains("captcha", StringComparison.OrdinalIgnoreCase) == true) &&
+        (string.Equals(config.RunnerPhase, "paused", StringComparison.OrdinalIgnoreCase) ||
+         string.Equals(config.RunnerPhase, "error", StringComparison.OrdinalIgnoreCase));
 
-    private async Task HandleCaptchaHandoffAsync(InstanceEntry source)
+    private static bool IsProxyPaused(InstanceConfig config) =>
+        string.Equals(config.RunnerPhase, "paused", StringComparison.OrdinalIgnoreCase) &&
+        (config.LastRunnerMessage?.Contains("proxy", StringComparison.OrdinalIgnoreCase) == true ||
+         config.LastRunnerMessage?.Contains("không tải được trang", StringComparison.OrdinalIgnoreCase) == true);
+
+    // Hết dữ liệu: range dòng vượt cuối sheet → LauncherRunnerLoop ném "Không có link hợp lệ...".
+    private static bool IsNoDataError(InstanceConfig config) =>
+        config.LastRunnerMessage?.Contains("link hợp lệ", StringComparison.OrdinalIgnoreCase) == true ||
+        config.LastRunnerMessage?.Contains("Không có link", StringComparison.OrdinalIgnoreCase) == true;
+
+    private async Task HandleCaptchaHandoffAsync(InstanceEntry source, string reason = "captcha")
     {
         var autoActive = _batchScheduler.IsActive;
-        if (autoActive)
-            _batchScheduler.ReleaseSlotWithoutFill(source.Config.Id);
-
-        var replacement = FindCaptchaReplacement(source, autoActive);
         var sourceRow = source.Config.CurrentRow
                         ?? source.Config.NextRunRow
                         ?? source.Config.GetEffectiveRunRow()
                         ?? source.Config.StartRow;
 
         AppendLog(
-            $"[{source.Config.DisplayName}] Gap captcha tai dong {sourceRow?.ToString() ?? "?"} - dong profile va chuyen sang instance ke tiep.");
+            $"[{source.Config.DisplayName}] Gap {reason} tai dong {sourceRow?.ToString() ?? "?"} - dong profile (giu trang thai de chay lai sau) va chuyen sang profile ke tiep.");
         AppendInstanceLog(source.Config,
-            $"Gap captcha tai dong {sourceRow?.ToString() ?? "?"} - dong profile.", selectTab: true);
+            $"Gap {reason} tai dong {sourceRow?.ToString() ?? "?"} - dong profile, chuyen instance ke.", selectTab: true);
 
-        try
-        {
-            if (source.Session.IsRunning)
-                await source.Session.StopAsync(CancellationToken.None).ConfigureAwait(true);
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"[{source.Config.DisplayName}] Dong profile sau captcha loi: {ex.Message}");
-        }
+        source.Config.RunnerRunning = false;
+        source.Config.RunnerPhase = "paused";
+        source.Config.LastRunnerMessage = $"Dừng vì {reason} tại dòng {sourceRow?.ToString() ?? "?"} — cần chạy lại.";
+
+        // Chỉ ĐÁNH DẤU (bật cờ) khi captcha xảy ra trong PHIÊN AUTO. Chạy manual có người kiểm soát trực
+        // tiếp nên không đánh dấu. KHÔNG bao giờ tự tắt cờ ở đây: chỉ user bấm "Đã giải captcha" mới gỡ
+        // profile khỏi tab Error (xem ResolveSelectedCaptcha). Proxy không tính là captcha-error.
+        if (autoActive && string.Equals(reason, "captcha", StringComparison.OrdinalIgnoreCase))
+            source.Config.CaptchaError = true;
 
         RefreshListItem(source.Config.Id);
-
-        if (replacement is null)
-        {
-            if (autoActive)
-                _batchScheduler.Stop();
-            _statusStripLabel.Text = "Captcha: khong con instance ke tiep de chuyen.";
-            AppendLog("Captcha: khong con instance ke tiep chua chay - dung.");
-            PersistSettings();
-            UpdateAutoToolbarButtons();
-            return;
-        }
-
-        var shiftedEntries = ShiftRunnerConfigsDownForCaptchaHandoff(replacement, autoActive);
-        if (shiftedEntries is null)
-        {
-            if (autoActive)
-                _batchScheduler.Stop();
-            _statusStripLabel.Text = "Captcha: khong dich duoc config sang profile sau.";
-            AppendLog(
-                $"[{source.Config.DisplayName}] Captcha: khong dich duoc config tu [{replacement.Config.DisplayName}] sang profile sau - dung de tranh mat config.");
-            PersistSettings();
-            UpdateAutoToolbarButtons();
-            return;
-        }
-
-        CopyRunnerConfigForCaptchaHandoff(source.Config, replacement.Config);
-        replacement.Session.ApplyConfig(replacement.Config);
-        foreach (var entry in shiftedEntries)
-            entry.Session.ApplyConfig(entry.Config);
-        foreach (var entry in shiftedEntries.Prepend(replacement).DistinctBy(e => e.Config.Id))
-            RefreshListItem(entry.Config.Id);
-        if (_selected?.Config.Id == replacement.Config.Id)
-            _detailPanel.RefreshProgressFromConfig();
         PersistSettings();
-
-        if (shiftedEntries.Count > 0)
-        {
-            AppendLog(
-                $"[{source.Config.DisplayName}] Da dich config tu [{replacement.Config.DisplayName}] xuong {shiftedEntries.Count} profile phia sau truoc khi handoff.");
-        }
-        AppendLog(
-            $"[{source.Config.DisplayName}] Copy runner config sang [{replacement.Config.DisplayName}] va chay tiep tu dong {replacement.Config.NextRunRow?.ToString() ?? "?"}.");
-        AppendInstanceLog(replacement.Config,
-            $"Nhan config tu {source.Config.DisplayName}, chay tiep tu dong {replacement.Config.NextRunRow?.ToString() ?? "?"}.",
-            selectTab: true);
 
         if (autoActive)
         {
-            if (!_batchScheduler.ReserveSlot(replacement.Config.Id))
-                return;
-
-            _ = Task.Run(async () =>
+            // AUTO: cả captcha lẫn proxy đều ĐÓNG profile lỗi rồi NHẢ SLOT để scheduler mở profile kế.
+            // Captcha KHÔNG dừng chờ giải tay khi auto (đã đánh dấu CaptchaError ở trên → vào tab Error;
+            // user giải tay sau bằng nút "Đã giải captcha"). Giải captcha rồi resume-scrape hiện chưa ổn
+            // nên không giữ profile lại giữa phiên auto — cứ đổi sang profile khác cho liền mạch.
+            try
             {
-                try
-                {
-                    await DispatchBatchRunnerAsync(replacement.Config.Id).ConfigureAwait(false);
-                }
-                finally
-                {
-                    _batchScheduler.TryFillSlots();
-                }
-            });
-        }
-        else
-        {
-            await StartManualCaptchaReplacementAsync(replacement).ConfigureAwait(true);
+                if (source.Session.IsRunning)
+                    await StopInstanceWorkAsync(source).ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[{source.Config.DisplayName}] Dong profile sau {reason}: {ex.Message}");
+            }
+
+            _batchScheduler.ReleaseSlot(source.Config.Id);
         }
 
         UpdateBatchStatusLabel();
-    }
-
-    private InstanceEntry? FindCaptchaReplacement(InstanceEntry source, bool autoActive)
-    {
-        var dispatched = autoActive
-            ? _batchScheduler.GetDispatchedSnapshot()
-            : new HashSet<string>(StringComparer.Ordinal);
-
-        var sourceIndex = _entries.IndexOf(source);
-        if (sourceIndex < 0)
-            return null;
-
-        var startIndex = sourceIndex + 1;
-        if (autoActive && dispatched.Count > 0)
-        {
-            var lastDispatchedIndex = _entries
-                .Select((entry, index) => dispatched.Contains(entry.Config.Id) ? index : -1)
-                .DefaultIfEmpty(-1)
-                .Max();
-            if (lastDispatchedIndex >= 0)
-                startIndex = lastDispatchedIndex + 1;
-        }
-
-        for (var i = startIndex; i < _entries.Count; i++)
-        {
-            var candidate = _entries[i];
-            if (autoActive && (!IsInAutoRunRange(candidate) || dispatched.Contains(candidate.Config.Id)))
-                continue;
-            if (candidate.Session.IsRunning ||
-                candidate.Session.IsBusy ||
-                candidate.Session.IsRunnerLoopActive ||
-                candidate.Session.IsRunnerLoopPending)
-                continue;
-            return candidate;
-        }
-
-        return null;
-    }
-
-    private List<InstanceEntry>? ShiftRunnerConfigsDownForCaptchaHandoff(InstanceEntry replacement, bool autoActive)
-    {
-        var replacementIndex = _entries.IndexOf(replacement);
-        if (replacementIndex < 0)
-            return null;
-
-        var displaced = CaptureRunnerConfig(replacement.Config);
-        if (!displaced.HasMeaningfulConfig)
-            return [];
-
-        var dispatched = autoActive
-            ? _batchScheduler.GetDispatchedSnapshot()
-            : new HashSet<string>(StringComparer.Ordinal);
-        var affected = new List<InstanceEntry>();
-
-        for (var i = replacementIndex + 1; i < _entries.Count; i++)
-        {
-            var entry = _entries[i];
-            if (autoActive && (!IsInAutoRunRange(entry) || dispatched.Contains(entry.Config.Id)))
-                continue;
-            if (entry.Session.IsRunning ||
-                entry.Session.IsBusy ||
-                entry.Session.IsRunnerLoopActive ||
-                entry.Session.IsRunnerLoopPending)
-                continue;
-
-            var current = CaptureRunnerConfig(entry.Config);
-            ApplyRunnerConfigSnapshot(displaced, entry.Config);
-            affected.Add(entry);
-
-            if (!current.HasMeaningfulConfig)
-                return affected;
-
-            displaced = current;
-        }
-
-        return null;
-    }
-
-    private static void CopyRunnerConfigForCaptchaHandoff(InstanceConfig source, InstanceConfig target)
-    {
-        var resumeRow = source.CurrentRow
-                        ?? source.NextRunRow
-                        ?? source.GetEffectiveRunRow()
-                        ?? source.StartRow;
-
-        target.DataSheet = source.DataSheet;
-        target.StartRow = source.StartRow;
-        target.EndRow = source.EndRow;
-        target.NextRunRow = resumeRow;
-        target.CurrentRow = source.CurrentRow;
-        target.LastCompletedRow = source.LastCompletedRow;
-        target.LastSku = source.LastSku;
-        target.RunnerPhase = null;
-        target.RunnerRunning = false;
-        target.LastRunnerMessage = "";
-        target.RunLog.Clear();
-        target.ProgressSyncedAt = null;
-    }
-
-    private static RunnerConfigSnapshot CaptureRunnerConfig(InstanceConfig config) =>
-        new(
-            config.DataSheet,
-            config.StartRow,
-            config.EndRow,
-            config.NextRunRow,
-            config.CurrentRow,
-            config.LastCompletedRow,
-            config.LastSku,
-            config.RunnerPhase,
-            config.RunnerRunning,
-            config.LastRunnerMessage,
-            config.RunLog
-                .Select(entry => new RunnerLogEntry
-                {
-                    RowNumber = entry.RowNumber,
-                    Sku = entry.Sku,
-                    ScrapeOk = entry.ScrapeOk,
-                    VideoOk = entry.VideoOk,
-                    VideoPath = entry.VideoPath,
-                })
-                .ToList(),
-            config.ProgressSyncedAt);
-
-    private static void ApplyRunnerConfigSnapshot(RunnerConfigSnapshot snapshot, InstanceConfig target)
-    {
-        target.DataSheet = snapshot.DataSheet;
-        target.StartRow = snapshot.StartRow;
-        target.EndRow = snapshot.EndRow;
-        target.NextRunRow = snapshot.NextRunRow;
-        target.CurrentRow = snapshot.CurrentRow;
-        target.LastCompletedRow = snapshot.LastCompletedRow;
-        target.LastSku = snapshot.LastSku;
-        target.RunnerPhase = snapshot.RunnerPhase;
-        target.RunnerRunning = snapshot.RunnerRunning;
-        target.LastRunnerMessage = snapshot.LastRunnerMessage;
-        target.RunLog = snapshot.RunLog
-            .Select(entry => new RunnerLogEntry
-            {
-                RowNumber = entry.RowNumber,
-                Sku = entry.Sku,
-                ScrapeOk = entry.ScrapeOk,
-                VideoOk = entry.VideoOk,
-                VideoPath = entry.VideoPath,
-            })
-            .ToList();
-        target.ProgressSyncedAt = snapshot.ProgressSyncedAt;
-    }
-
-    private async Task StartManualCaptchaReplacementAsync(InstanceEntry replacement)
-    {
-        var brave = GetBraveExe();
-        var userData = GetSourceUserData();
-        if (string.IsNullOrWhiteSpace(brave) || string.IsNullOrWhiteSpace(userData))
-        {
-            AppendLog($"[{replacement.Config.DisplayName}] Khong chay duoc instance thay the: thieu Brave/User Data.");
-            return;
-        }
-
-        try
-        {
-            _statusStripLabel.Text =
-                $"{replacement.Config.DisplayName}: chay thay profile captcha tu dong {replacement.Config.NextRunRow}";
-            await RunManualWithExtensionRetryAsync(replacement, brave, userData, preferSuggestedResume: true)
-                .ConfigureAwait(true);
-            RefreshListItem(replacement.Config.Id);
-            PersistSettings();
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"[{replacement.Config.DisplayName}] Chay thay profile captcha loi: {ex.Message}");
-            MessageBox.Show(this, ex.Message, "Chay thay profile captcha", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
+        UpdateAutoToolbarButtons();
     }
 
     private string? FindNextBatchInstanceId(HashSet<string> dispatched)
     {
-        foreach (var entry in _entries)
+        // CHỈ chạy đúng tập profile đã chốt khi bắt đầu lượt (theo thứ tự đã chốt). Hết tập này thì trả null
+        // → scheduler dừng lượt, KHÔNG quay lại từ đầu dù range/active account có thay đổi giữa chừng.
+        foreach (var id in _batchPlannedIds)
         {
-            if (dispatched.Contains(entry.Config.Id)) continue;
-            if (!IsEligibleForBatch(entry)) continue;
+            if (dispatched.Contains(id)) continue;
+            var entry = _entries.FirstOrDefault(e => e.Config.Id == id);
+            if (entry is null) continue;
             if (entry.Session.IsRunnerLoopActive) continue;
-            return entry.Config.Id;
+            if (entry.Config.CaptchaError) continue;
+            if (!IsBatchConfigured(entry)) continue;
+            return id;
         }
         return null;
     }
 
+    // Đếm MỌI profile đang THỰC SỰ LÀM VIỆC trong account (đang launch hoặc runner active),
+    // KHÔNG chỉ trong range auto, để giữ trần Max đúng: profile còn scrape ngoài range (lượt trước,
+    // hoặc sau khi đổi "Instance từ") vẫn phải tính vào Max — nếu không scheduler mở thêm → vượt Max
+    // (vd. gõ "từ"=4 mà 1–3 còn chạy → thành 4+ profile). Bỏ IsRunning đơn thuần để cửa sổ đã chạy
+    // xong nhưng chưa đóng KHÔNG chiếm slot (tránh chạy ít hơn Max).
     private int CountOpenAutoProfiles() =>
         _entries.Count(e =>
-            IsInAutoRunRange(e) &&
-            (e.Session.IsRunning || e.Session.IsBusy || e.Session.IsRunnerLoopPending));
+            IsInActiveAccount(e) &&
+            (e.Session.IsBusy || e.Session.IsRunnerLoopPending));
 
     private async Task DispatchBatchRunnerAsync(string instanceId)
     {
@@ -1855,12 +1987,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             UpdateBatchStatusLabel();
         });
 
-        entry.Session.ApplyConfig(c);
-        await entry.Session.ResumeContinueAsync(
-                brave,
-                userData,
-                preferSuggestedResume: true,
-                retryExtensionStart: true)
+        await StartInstanceRunnerAsync(entry, brave, userData, preferSuggestedResume: true)
             .ConfigureAwait(false);
 
         // StartAsync + 3s chờ CDP — cần thời gian dài hơn 6s cũ.
@@ -1876,7 +2003,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             {
                 try
                 {
-                    await entry.Session.StopAsync(CancellationToken.None).ConfigureAwait(false);
+                    await StopInstanceWorkAsync(entry).ConfigureAwait(false);
                     BeginInvoke(() =>
                         AppendLog($"[{c.DisplayName}] Auto — đóng profile vì runner không chạy."));
                 }
@@ -1932,30 +2059,6 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         return runRow is > 0 && c.TryValidateRunRow(runRow.Value, out _);
     }
 
-    private async Task ImportBigSellerCookieIntoRunningProfileAsync(InstanceEntry entry)
-    {
-        try
-        {
-            if (!await entry.Session.WaitForCdpReadyAsync().ConfigureAwait(true))
-            {
-                AppendLog($"[{entry.Config.DisplayName}] Bo qua import BigSeller: profile dang restart hoac CDP da tat.");
-                RefreshListItem(entry.Config.Id);
-                return;
-            }
-
-            var count = await entry.Session.ImportCookiesFromFileAsync(
-                entry.Config.BigSellerCookieFile,
-                includeShopee: false,
-                includeBigSeller: true,
-                prepareBigSellerPage: true).ConfigureAwait(true);
-            AppendLog($"[{entry.Config.DisplayName}] Đã nhập {count} cookie BigSeller.");
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"[{entry.Config.DisplayName}] Nhập cookie BigSeller lỗi: {ex.Message}");
-        }
-    }
-
     private void ApplyAutoRowRangesToInstances(string autoSheetName, int autoStartRow, int rowsPerProfile)
     {
         var targets = GetActiveShopEntries();
@@ -1998,18 +2101,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         AppendLog(_statusStripLabel.Text);
     }
 
-    private void BrowseCookieFile(TextBox target)
-    {
-        using var d = new OpenFileDialog
-        {
-            Filter = "JSON cookie (*.json)|*.json|All files|*.*",
-            Title = "Chọn file cookie BigSeller",
-        };
-        if (d.ShowDialog(this) == DialogResult.OK)
-            target.Text = d.FileName;
-    }
-
-    private void OnInstanceSelected()
+    private void OnInstanceSelected(ListView list)
     {
         if (_suppressInstanceSelection)
             return;
@@ -2017,7 +2109,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         UpdateManualActionButtons();
         _detailPanel.FlushToConfig();
 
-        if (_instanceList.SelectedItems.Count == 0)
+        if (list.SelectedItems.Count == 0)
         {
             _selected = null;
             BindDetailPanel(null);
@@ -2025,7 +2117,19 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             return;
         }
 
-        var id = _instanceList.SelectedItems[0].Tag as string;
+        var otherList = list == _instanceList ? _errorInstanceList : _instanceList;
+        _suppressInstanceSelection = true;
+        try
+        {
+            foreach (ListViewItem selected in otherList.SelectedItems.Cast<ListViewItem>().ToList())
+                selected.Selected = false;
+        }
+        finally
+        {
+            _suppressInstanceSelection = false;
+        }
+
+        var id = list.SelectedItems[0].Tag as string;
         _selected = _entries.FirstOrDefault(e => e.Config.Id == id);
         if (_selected is null) return;
 
@@ -2094,7 +2198,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         try
         {
             entry.Session.ApplyConfig(c);
-            await entry.Session.StopRunnerAsync();
+            await StopInstanceWorkAsync(entry).ConfigureAwait(true);
             _detailPanel.RefreshProgressFromConfig();
             RefreshListItem(c.Id);
             PersistSettings();
@@ -2122,6 +2226,9 @@ internal sealed class ShopeeWorkspaceControl : UserControl
                 Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+
+        if (!EnsureShopChosen())
+            return;
 
         _detailPanel.FlushToConfig();
 
@@ -2174,8 +2281,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         _detailPanel.SetBusy(true, "Đang chạy…");
         try
         {
-            entry.Session.ApplyConfig(c);
-            await RunManualWithExtensionRetryAsync(entry, brave, userData, preferSuggestedResume: true)
+            await StartInstanceRunnerAsync(entry, brave, userData, preferSuggestedResume: true)
                 .ConfigureAwait(true);
             _detailPanel.RefreshProgressFromConfig();
             RefreshListItem(c.Id);
@@ -2217,6 +2323,9 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             return;
         }
 
+        if (!EnsureShopChosen())
+            return;
+
         _detailPanel.FlushToConfig();
 
         var entry = _selected;
@@ -2256,8 +2365,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         _detailPanel.SetBusy(true, "Đang chạy tiếp…");
         try
         {
-            entry.Session.ApplyConfig(c);
-            await RunManualWithExtensionRetryAsync(entry, brave, userData, preferSuggestedResume: true)
+            await StartInstanceRunnerAsync(entry, brave, userData, preferSuggestedResume: true)
                 .ConfigureAwait(true);
             _detailPanel.RefreshProgressFromConfig();
             RefreshListItem(c.Id);
@@ -2295,18 +2403,24 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             BindDetailPanel(_selected);
     }
 
-    private async Task RunManualWithExtensionRetryAsync(
+    private async Task StartInstanceRunnerAsync(
         InstanceEntry entry,
         string brave,
         string userData,
         bool preferSuggestedResume)
     {
+        entry.Session.ApplyConfig(entry.Config);
         await entry.Session.ResumeContinueAsync(
                 brave,
                 userData,
                 preferSuggestedResume,
                 retryExtensionStart: true)
             .ConfigureAwait(true);
+    }
+
+    private async Task StopInstanceWorkAsync(InstanceEntry entry)
+    {
+        await entry.Session.StopRunningWorkAsync().ConfigureAwait(true);
     }
 
     private RichTextBox EnsureInstanceLogTab(InstanceConfig config, bool selectTab = false)
@@ -2372,30 +2486,52 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         if (entry is null) return;
 
         var visible = IsVisibleInActiveShop(entry);
-        for (var i = 0; i < _instanceList.Items.Count; i++)
+        var item = FindListItem(id, out var owner);
+        if (item is not null)
         {
-            var item = _instanceList.Items[i];
-            if (item.Tag as string != id) continue;
             if (!visible)
             {
                 RefreshInstanceList();
                 return;
             }
-            if (item.SubItems.Count < 4)
+            if (item.SubItems.Count < 5)
             {
                 RefreshInstanceList();
                 return;
             }
 
-            item.Text = entry.Config.DisplayName;
-            item.SubItems[1].Text = entry.Session.StatusText;
-            item.SubItems[2].Text = TruncateProgress(entry.Config.ProgressSummary);
-            item.SubItems[3].Text = TruncateProxy(entry.Session.ProxySummary);
+            var targetList = GetListForEntry(entry);
+            var wasSelected = item.Selected;
+            if (owner != targetList)
+            {
+                _suppressInstanceSelection = true;
+                try
+                {
+                    owner?.Items.Remove(item);
+                    targetList.Items.Add(CreateListItem(entry));
+                    RenumberInstanceLists();
+                }
+                finally
+                {
+                    _suppressInstanceSelection = false;
+                }
+
+                if (wasSelected)
+                    BindDetailPanel(entry);
+            }
+            else
+            {
+                UpdateListItem(item, entry);
+            }
+            UpdateManualActionButtons();
             return;
         }
 
         if (visible)
-            _instanceList.Items.Add(CreateListItem(entry));
+        {
+            GetListForEntry(entry).Items.Add(CreateListItem(entry));
+            RenumberInstanceLists();
+        }
         UpdateManualActionButtons();
     }
 
@@ -2415,7 +2551,9 @@ internal sealed class ShopeeWorkspaceControl : UserControl
     {
         try
         {
-            SyncWorkspaceDefaultsToEntries();
+            // Saving can be triggered by editing proxy fields. Do not let a plain save
+            // overwrite the profile's runner sheet from the shop default.
+            SyncWorkspaceDefaultsToEntries(syncSheet: false);
             InstanceRegistry.PersistSettings(
                 _settings,
                 _entries,
@@ -2594,30 +2732,6 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         if (string.IsNullOrWhiteSpace(local)) return null;
         var path = Path.Combine(local, "BraveSoftware", "Brave-Browser", "User Data");
         return Directory.Exists(path) ? new DirectoryInfo(path) : null;
-    }
-
-    private sealed record RunnerConfigSnapshot(
-        string DataSheet,
-        int? StartRow,
-        int? EndRow,
-        int? NextRunRow,
-        int? CurrentRow,
-        int? LastCompletedRow,
-        string? LastSku,
-        string? RunnerPhase,
-        bool? RunnerRunning,
-        string? LastRunnerMessage,
-        List<RunnerLogEntry> RunLog,
-        DateTimeOffset? ProgressSyncedAt)
-    {
-        public bool HasMeaningfulConfig =>
-            !string.IsNullOrWhiteSpace(DataSheet) ||
-            StartRow is > 0 ||
-            EndRow is > 0 ||
-            NextRunRow is > 0 ||
-            CurrentRow is > 0 ||
-            LastCompletedRow is > 0 ||
-            RunLog.Count > 0;
     }
 
 }

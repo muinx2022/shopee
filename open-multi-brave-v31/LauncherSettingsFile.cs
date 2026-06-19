@@ -21,8 +21,13 @@ public sealed class LauncherSettingsFile
     public int AutoStartRow { get; set; } = 2;
     /// <summary>Số cộng vào start row để ra to row cho mỗi profile.</summary>
     public int AutoRowsPerProfile { get; set; } = 30;
-    public List<BigSellerAccountConfig> Accounts { get; set; } = [];
+    public List<AccountConfig> Accounts { get; set; } = [];
     public string ActiveAccountId { get; set; } = "";
     public string ActiveShopId { get; set; } = "";
     public List<InstanceConfig> Instances { get; set; } = [];
+
+    /// <summary>Bật tự giải captcha Shopee (slider/rotate) qua dịch vụ AntiCaptcha.top khi gặp verify.</summary>
+    public bool AntiCaptchaEnabled { get; set; } = true;
+    /// <summary>API key AntiCaptcha.top dùng để giải captcha (dùng chung cho mọi profile).</summary>
+    public string AntiCaptchaApiKey { get; set; } = "5da4d6cf944c5604738dc0d9a708fb4e";
 }

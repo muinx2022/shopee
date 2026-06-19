@@ -6,7 +6,7 @@ namespace OpenMultiBraveLauncherV3;
 internal static class LauncherRunnerLoop
 {
     private const int MinRestMs = 120_000;
-    private const int MaxRestMs = 300_000;
+    private const int MaxRestMs = 240_000;
     private const int VideoMaxDurationS = 60;
     private const int MaxDownloadRetries = 1;
     private static readonly Random RestRandom = new();
@@ -17,9 +17,10 @@ internal static class LauncherRunnerLoop
         InstanceConfig config,
         Action<string> log,
         Action onProgress,
-        Func<Task>? ensureBigSellerCookies,
         bool preferSuggestedResume,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<Task>? onBeforeExtensionReady = null,
+        Func<Task>? onAfterExtensionReady = null)
     {
         var sheet = config.DataSheet?.Trim()
             ?? throw new InvalidOperationException("Thiếu sheet.");
@@ -55,8 +56,17 @@ internal static class LauncherRunnerLoop
         if (fetch.SkippedMissingLink > 0)
             log($"Bỏ qua {fetch.SkippedMissingLink} dòng vì cột A không có link hợp lệ.");
 
+        if (onBeforeExtensionReady is not null)
+            await onBeforeExtensionReady().ConfigureAwait(false);
+
         await ExtensionRunnerAutomation.EnsureRunnerExtensionReadyAsync(
             cdpPort, profileRoot, log, cancellationToken).ConfigureAwait(false);
+
+        if (onAfterExtensionReady is not null)
+            await onAfterExtensionReady().ConfigureAwait(false);
+
+        await ExtensionRunnerAutomation.TrimAuxiliaryTabsAsync(cdpPort, cancellationToken)
+            .ConfigureAwait(false);
 
         await ExtensionRunnerAutomation.TryApplyFormConfigAsync(
             cdpPort, profileRoot, sheet, config.StartRow, config.EndRow ?? endRow, cancellationToken).ConfigureAwait(false);
@@ -85,9 +95,6 @@ internal static class LauncherRunnerLoop
                 var link = item.Link;
                 var sku = ExtractSkuFromRow(rowData, rowNumber);
 
-                if (ensureBigSellerCookies is not null)
-                    await ensureBigSellerCookies().ConfigureAwait(false);
-
                 config.CurrentRow = rowNumber;
                 config.RunnerPhase = "opening";
                 config.LastRunnerMessage = $"Đang mở link {index + 1}/{totalLinks} — dòng {rowNumber} (SKU: {sku}).";
@@ -98,6 +105,7 @@ internal static class LauncherRunnerLoop
                 onProgress();
 
                 var statusText = $"Đang mở link {index + 1}/{totalLinks} — dòng {rowNumber}.";
+
                 var step = await ExtensionRunnerAutomation.ExecuteScrapeStepAsync(
                     cdpPort,
                     profileRoot,
@@ -108,21 +116,6 @@ internal static class LauncherRunnerLoop
                     sku,
                     tabId,
                     cancellationToken).ConfigureAwait(false);
-
-                if (!step.ScrapeOk && step.TabId is null && tabId is not null)
-                {
-                    tabId = null;
-                    step = await ExtensionRunnerAutomation.ExecuteScrapeStepAsync(
-                        cdpPort,
-                        profileRoot,
-                        link,
-                        rowNumber,
-                        statusText,
-                        config.DisplayName,
-                        sku,
-                        null,
-                        cancellationToken).ConfigureAwait(false);
-                }
 
                 if (step.Aborted)
                     throw new OperationCanceledException();
@@ -141,9 +134,10 @@ internal static class LauncherRunnerLoop
 
                 if (step.Captcha && !step.ScrapeOk)
                 {
+                    // Gặp captcha → DỪNG tại chỗ, giữ nguyên profile (paused) để giải tay rồi chạy tiếp.
                     config.RunnerPhase = "paused";
                     config.LastRunnerMessage =
-                        step.Message ?? $"Dừng vì captcha - {config.DisplayName}, dòng {rowNumber} (SKU: {sku}).";
+                        step.Message ?? $"Dừng vì captcha - {config.DisplayName}, dòng {rowNumber} (SKU: {sku}). Giải tay rồi chạy tiếp.";
                     await PushDisplayStateAsync(
                         cdpPort, profileRoot, config, sheet, startRow, endRow.Value,
                         index + 1, totalLinks, step.TabId, cancellationToken).ConfigureAwait(false);
@@ -152,17 +146,24 @@ internal static class LauncherRunnerLoop
                     return;
                 }
 
-                tabId = step.TabId;
+                tabId = step.TabId ?? tabId;
 
                 var scrapeOk = step.ScrapeOk;
                 if (scrapeOk)
                 {
+                    // GHI NHẬN dòng đã scrape NGAY (trước bước video). Nếu extension/CDP rớt giữa chừng,
+                    // reload có thể làm rớt service worker → launcher relaunch profile và chạy lại RunAsync.
+                    // Nếu chưa ghi nhận, RunAsync resume ĐÚNG dòng cũ → mở lại link → scrape → reload → LẶP VÔ HẠN.
+                    // Ghi nhận sớm ⇒ relaunch resume ở dòng KẾ. Video tải sau là phụ; mất video 1 dòng ≪ kẹt lặp.
+                    config.LastCompletedRow = rowNumber;
+                    config.NextRunRow = rowNumber + 1;
+
                     if (step.Captcha)
                         log($"Đã giải captcha và click scrape - dòng {rowNumber}.");
-                    log($"�� click scrape � d�ng {rowNumber}.");
+                    log($"Đã click scrape - dòng {rowNumber}.");
                     await TryShowOverlayAsync(
                         cdpPort, profileRoot, tabId,
-                        $"�� click scrape � d�ng {rowNumber}.\n�ang qu�t video SKU {sku}�",
+                        $"Đã click scrape - dòng {rowNumber}.\nĐang quét video SKU {sku}…",
                         cancellationToken).ConfigureAwait(false);
                 }
                 else
@@ -320,14 +321,16 @@ internal static class LauncherRunnerLoop
                         }
                         catch
                         {
-                            tabId = null;
+                            // Giữ tabId — link tiếp theo vẫn navigate trong cùng tab.
                         }
                     }
 
                     log(waitMsg);
                     var preCheckDelay = Math.Max(0, restMs - 30_000);
-                    if (preCheckDelay > 0)
-                        await Task.Delay(preCheckDelay, cancellationToken).ConfigureAwait(false);
+                    // Trong lúc chờ link kế: giả lập người dùng xem trang (cuộn nhẹ từng nhịp) thay vì
+                    // để cửa sổ đứng im — trông tự nhiên hơn với Shopee.
+                    await SimulateBrowsingDuringRestAsync(
+                        cdpPort, pageUrl, preCheckDelay, cancellationToken).ConfigureAwait(false);
 
                     if (tabId is not null)
                     {
@@ -447,6 +450,37 @@ internal static class LauncherRunnerLoop
         catch
         {
             // tab có thể đã đóng
+        }
+    }
+
+    /// <summary>
+    /// Chờ <paramref name="totalMs"/>, nhưng chia thành nhịp ngẫu nhiên 12–35s, sau mỗi nhịp cuộn trang
+    /// Shopee hiện tại để giả lập người dùng đang xem. Best-effort, tôn trọng cancellation (nút Dừng).
+    /// </summary>
+    private static async Task SimulateBrowsingDuringRestAsync(
+        int cdpPort,
+        string pageUrlHint,
+        int totalMs,
+        CancellationToken cancellationToken)
+    {
+        if (totalMs <= 0)
+            return;
+
+        var deadline = DateTimeOffset.Now.AddMilliseconds(totalMs);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var remaining = (deadline - DateTimeOffset.Now).TotalMilliseconds;
+            if (remaining <= 0)
+                break;
+
+            var chunk = (int)Math.Min(remaining, Random.Shared.Next(12_000, 35_000));
+            await Task.Delay(chunk, cancellationToken).ConfigureAwait(false);
+
+            if (cancellationToken.IsCancellationRequested || DateTimeOffset.Now >= deadline)
+                break;
+
+            await PageCdpHelper.SimulateHumanBrowsingAsync(cdpPort, pageUrlHint, cancellationToken)
+                .ConfigureAwait(false);
         }
     }
 
