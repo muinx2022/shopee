@@ -1,21 +1,20 @@
 using ClosedXML.Excel;
-using System.Text.Json;
 
 namespace OpenMultiBraveLauncherV3;
 
-internal sealed class AccountShopManagerForm : Form
+/// <summary>
+/// Panel cài đặt cho một account cụ thể — nhúng vào tab "Cài đặt" trong workspace.
+/// </summary>
+internal sealed class AccountSettingsPanel : UserControl
 {
-    private readonly List<AccountConfig> _accounts;
-    private readonly ListBox _accountList = new();
+    private readonly LauncherSettingsFile _settings;
+    private readonly string _accountId;
     private readonly ListBox _shopList = new();
     private readonly TextBox _emailTextBox = new();
     private readonly TextBox _workbookTextBox = new();
     private readonly TextBox _bigSellerCookieFileTextBox = new();
     private readonly TextBox _shopNameTextBox = new();
     private readonly ComboBox _sheetComboBox = new() { DropDownStyle = ComboBoxStyle.DropDown };
-    private bool _suppressChanges;
-    private readonly string _braveExe;
-    private readonly string _sourceUserData;
     private readonly Label _bigSellerStatusLabel = new();
     private RichTextBox _loginLogBox = null!;
     private Panel _loginLogPanel = null!;
@@ -23,103 +22,67 @@ internal sealed class AccountShopManagerForm : Form
     private TableLayoutPanel? _rootTable;
     private BigSellerLoginRunner? _loginRunner;
     private CancellationTokenSource? _loginCts;
+    private bool _suppressChanges;
 
-    public AccountShopManagerForm(
-        IReadOnlyList<AccountConfig> accounts,
-        string activeAccountId,
-        string activeShopId,
-        string braveExe,
-        string sourceUserData)
+    public AccountSettingsPanel(LauncherSettingsFile settings, string accountId)
     {
-        _braveExe = braveExe;
-        _sourceUserData = sourceUserData;
-        _accounts = Clone(accounts);
-        if (_accounts.Count == 0)
-            _accounts.Add(AccountConfig.CreateDefault());
-
-        ActiveAccountId = activeAccountId;
-        ActiveShopId = activeShopId;
-
-        Text = "Account / shop";
-        StartPosition = FormStartPosition.CenterParent;
-        Width = 920;
-        Height = 560;
-        MinimumSize = new Size(780, 460);
-
+        _settings = settings;
+        _accountId = accountId;
+        Dock = DockStyle.Fill;
         Controls.Add(CreateLayout());
-        Load += (_, _) => RefreshLists();
-        FormClosing += (_, _) => CleanupLogin();
+        Load += (_, _) => RefreshShopList();
+        HandleDestroyed += (_, _) => CleanupLogin();
     }
 
-    public IReadOnlyList<AccountConfig> Accounts => _accounts;
-    public string ActiveAccountId { get; private set; }
-    public string ActiveShopId { get; private set; }
+    private AccountConfig? ActiveAccount =>
+        _settings.Accounts.FirstOrDefault(a => a.Id == _accountId);
+
+    private ShopConfig? CurrentShop =>
+        ActiveAccount is { } account && _shopList.SelectedItem is SelectorItem item
+            ? account.Shops.FirstOrDefault(s => s.Id == item.Id)
+            : null;
 
     private Control CreateLayout()
     {
         _rootTable = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 3,
+            ColumnCount = 2,
             RowCount = 3,
             Padding = new Padding(10),
         };
-        _rootTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 220));
-        _rootTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 220));
+        _rootTable.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 200));
         _rootTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _rootTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        _rootTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));   // log panel (ẩn ban đầu)
+        _rootTable.RowStyles.Add(new RowStyle(SizeType.Absolute, 0));  // log panel, ẩn ban đầu
         _rootTable.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        _rootTable.Controls.Add(CreateAccountPanel(), 0, 0);
-        _rootTable.Controls.Add(CreateShopPanel(), 1, 0);
-        _rootTable.Controls.Add(CreateDetailPanel(), 2, 0);
+        _rootTable.Controls.Add(CreateShopPanel(), 0, 0);
+        _rootTable.Controls.Add(CreateDetailPanel(), 1, 0);
 
         _loginLogPanel = CreateLoginLogPanel();
         _rootTable.Controls.Add(_loginLogPanel, 0, 1);
-        _rootTable.SetColumnSpan(_loginLogPanel, 3);
+        _rootTable.SetColumnSpan(_loginLogPanel, 2);
 
         var actions = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.RightToLeft,
             AutoSize = true,
+            Padding = new Padding(0, 4, 0, 0),
         };
-        var ok = new Button { Text = "OK", AutoSize = true, Padding = new Padding(12, 0, 12, 0), DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = "Hủy", AutoSize = true, Padding = new Padding(12, 0, 12, 0), DialogResult = DialogResult.Cancel };
-        ok.Click += (_, _) => SaveCurrent();
-        actions.Controls.Add(ok);
-        actions.Controls.Add(cancel);
-        _rootTable.SetColumnSpan(actions, 3);
+        var saveBtn = new Button { Text = "Lưu cài đặt", AutoSize = true, Padding = new Padding(16, 0, 16, 0) };
+        saveBtn.Click += (_, _) => SaveAndPersist();
+        actions.Controls.Add(saveBtn);
+        _rootTable.SetColumnSpan(actions, 2);
         _rootTable.Controls.Add(actions, 0, 2);
-        AcceptButton = ok;
-        CancelButton = cancel;
 
         return _rootTable;
     }
 
-    private Control CreateAccountPanel()
-    {
-        var panel = CreatePanel("Account");
-        _accountList.Dock = DockStyle.Fill;
-        _accountList.SelectedIndexChanged += (_, _) => SelectAccount();
-
-        var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Bottom };
-        var add = new Button { Text = "Thêm", AutoSize = true, Padding = new Padding(10, 0, 10, 0) };
-        var remove = new Button { Text = "Xóa", AutoSize = true, Padding = new Padding(10, 0, 10, 0) };
-        add.Click += (_, _) => AddAccount();
-        remove.Click += (_, _) => RemoveAccount();
-        buttons.Controls.Add(add);
-        buttons.Controls.Add(remove);
-
-        panel.Controls.Add(_accountList);
-        panel.Controls.Add(buttons);
-        return panel;
-    }
-
     private Control CreateShopPanel()
     {
-        var panel = CreatePanel("Shop");
+        var panel = new GroupBox { Text = "Shop", Dock = DockStyle.Fill, Padding = new Padding(8) };
         _shopList.Dock = DockStyle.Fill;
         _shopList.SelectedIndexChanged += (_, _) => SelectShop();
 
@@ -138,7 +101,7 @@ internal sealed class AccountShopManagerForm : Form
 
     private Control CreateDetailPanel()
     {
-        var group = CreatePanel("Chi tiết");
+        var group = new GroupBox { Text = "Chi tiết", Dock = DockStyle.Fill, Padding = new Padding(8) };
         var table = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
@@ -155,7 +118,6 @@ internal sealed class AccountShopManagerForm : Form
         browse.Click += (_, _) => BrowseWorkbook();
         AddTextRow(table, 1, "Workbook", _workbookTextBox, browse);
 
-        // BigSeller cookie file + login button
         var bigSellerBrowse = new Button { Text = "...", Width = 34 };
         bigSellerBrowse.Click += (_, _) => BrowseBigSellerCookieFile();
         AddTextRow(table, 2, "BS Cookie", _bigSellerCookieFileTextBox, bigSellerBrowse);
@@ -166,7 +128,7 @@ internal sealed class AccountShopManagerForm : Form
             AutoSize = true,
             Margin = new Padding(0, 2, 0, 6),
         };
-        loginBtn.Click += (_, _) => OpenBigSellerLoginForm();
+        loginBtn.Click += (_, _) => OpenBigSellerLogin();
         table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         table.Controls.Add(loginBtn, 1, 3);
         table.SetColumnSpan(loginBtn, 2);
@@ -183,21 +145,24 @@ internal sealed class AccountShopManagerForm : Form
         AddTextRow(table, 5, "Tên shop", _shopNameTextBox, null);
         AddTextRow(table, 6, "Sheet Shopee", _sheetComboBox, null);
 
-        foreach (var box in new[] { _emailTextBox, _workbookTextBox, _bigSellerCookieFileTextBox, _shopNameTextBox })
-            box.TextChanged += (_, _) => SaveCurrent();
-        _sheetComboBox.TextChanged += (_, _) => SaveCurrent();
+        var saveShopBtn = new Button
+        {
+            Text = "Lưu shop",
+            AutoSize = true,
+            Margin = new Padding(0, 6, 0, 2),
+        };
+        saveShopBtn.Click += (_, _) => SaveAndPersist();
+        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        table.Controls.Add(saveShopBtn, 1, 7);
+        table.SetColumnSpan(saveShopBtn, 2);
+
         _bigSellerCookieFileTextBox.TextChanged += (_, _) => UpdateBigSellerStatus();
+        _workbookTextBox.Leave += (_, _) => RefreshSheetDropdown(_workbookTextBox.Text);
+        _sheetComboBox.DropDown += (_, _) => RefreshSheetDropdown(_workbookTextBox.Text);
 
         group.Controls.Add(table);
         return group;
     }
-
-    private static GroupBox CreatePanel(string text) => new()
-    {
-        Text = text,
-        Dock = DockStyle.Fill,
-        Padding = new Padding(8),
-    };
 
     private static void AddTextRow(TableLayoutPanel table, int row, string label, Control box, Control? button)
     {
@@ -211,66 +176,22 @@ internal sealed class AccountShopManagerForm : Form
             table.Controls.Add(button, 2, row);
     }
 
-    private void RefreshLists()
-    {
-        _suppressChanges = true;
-        try
-        {
-            _accountList.Items.Clear();
-            foreach (var account in _accounts)
-                _accountList.Items.Add(new SelectorItem(account.Id, account.DisplayName));
-
-            var accountIndex = Math.Max(0, _accounts.FindIndex(a => a.Id == ActiveAccountId));
-            if (_accountList.Items.Count > 0)
-                _accountList.SelectedIndex = accountIndex;
-            RefreshShopList();
-            LoadCurrent();
-        }
-        finally
-        {
-            _suppressChanges = false;
-        }
-    }
-
     private void RefreshShopList()
     {
-        _shopList.Items.Clear();
-        var account = CurrentAccount;
-        if (account is null)
-            return;
-
-        foreach (var shop in account.Shops)
-            _shopList.Items.Add(new SelectorItem(shop.Id, shop.DisplayName));
-
-        var shopIndex = Math.Max(0, account.Shops.FindIndex(s => s.Id == ActiveShopId));
-        if (_shopList.Items.Count > 0)
-            _shopList.SelectedIndex = shopIndex;
-    }
-
-    private AccountConfig? CurrentAccount =>
-        _accountList.SelectedItem is SelectorItem item
-            ? _accounts.FirstOrDefault(a => a.Id == item.Id)
-            : null;
-
-    private ShopConfig? CurrentShop =>
-        CurrentAccount is { } account && _shopList.SelectedItem is SelectorItem item
-            ? account.Shops.FirstOrDefault(s => s.Id == item.Id)
-            : null;
-
-    private void SelectAccount()
-    {
-        if (_suppressChanges)
-            return;
-        SaveCurrent();
-        if (CurrentAccount is { } account)
-        {
-            ActiveAccountId = account.Id;
-            ActiveShopId = account.Shops.FirstOrDefault()?.Id ?? "";
-        }
         _suppressChanges = true;
         try
         {
-            RefreshShopList();
+            var account = ActiveAccount;
+            _shopList.Items.Clear();
+            if (account is null) return;
+
+            foreach (var shop in account.Shops)
+                _shopList.Items.Add(new SelectorItem(shop.Id, shop.DisplayName));
+
+            var shopIndex = Math.Max(0, account.Shops.FindIndex(s => s.Id == _settings.ActiveShopId));
+            if (_shopList.Items.Count > 0)
+                _shopList.SelectedIndex = shopIndex;
+
             LoadCurrent();
         }
         finally
@@ -281,11 +202,9 @@ internal sealed class AccountShopManagerForm : Form
 
     private void SelectShop()
     {
-        if (_suppressChanges)
-            return;
-        SaveCurrent();
+        if (_suppressChanges) return;
         if (CurrentShop is { } shop)
-            ActiveShopId = shop.Id;
+            _settings.ActiveShopId = shop.Id;
         LoadCurrent();
     }
 
@@ -294,13 +213,13 @@ internal sealed class AccountShopManagerForm : Form
         _suppressChanges = true;
         try
         {
-            var account = CurrentAccount;
+            var account = ActiveAccount;
             var shop = CurrentShop;
             _emailTextBox.Text = account?.Email ?? "";
             _workbookTextBox.Text = account?.WorkbookPath ?? "";
             _bigSellerCookieFileTextBox.Text = account?.BigSellerCookieFile ?? "";
             _shopNameTextBox.Text = shop?.Name ?? "";
-            RefreshSheetDropdown(account?.WorkbookPath, shop?.ShopeeDataSheet);
+            _sheetComboBox.Text = shop?.ShopeeDataSheet ?? "";
             UpdateBigSellerStatus();
         }
         finally
@@ -316,6 +235,8 @@ internal sealed class AccountShopManagerForm : Form
 
         if (!string.IsNullOrWhiteSpace(workbookPath) && File.Exists(workbookPath))
         {
+            var prev = Cursor.Current;
+            Cursor.Current = Cursors.WaitCursor;
             try
             {
                 using var wb = new XLWorkbook(workbookPath);
@@ -323,6 +244,7 @@ internal sealed class AccountShopManagerForm : Form
                     _sheetComboBox.Items.Add(ws.Name);
             }
             catch { }
+            finally { Cursor.Current = prev; }
         }
 
         if (!string.IsNullOrWhiteSpace(previousText))
@@ -333,65 +255,52 @@ internal sealed class AccountShopManagerForm : Form
 
     private void SaveCurrent()
     {
-        if (_suppressChanges)
-            return;
-
-        if (CurrentAccount is { } account)
+        if (_suppressChanges) return;
+        var account = ActiveAccount;
+        if (account is not null)
         {
             account.Email = _emailTextBox.Text.Trim();
             account.WorkbookPath = _workbookTextBox.Text.Trim();
             account.BigSellerCookieFile = _bigSellerCookieFileTextBox.Text.Trim();
-            ActiveAccountId = account.Id;
         }
-
         if (CurrentShop is { } shop)
         {
             shop.Name = _shopNameTextBox.Text.Trim();
             shop.ShopeeDataSheet = _sheetComboBox.Text.Trim();
-            ActiveShopId = shop.Id;
+            _settings.ActiveShopId = shop.Id;
+
+            if (_shopList.SelectedIndex >= 0)
+                _shopList.Items[_shopList.SelectedIndex] = new SelectorItem(shop.Id, shop.DisplayName);
         }
     }
 
-    private void AddAccount()
+    private void SaveAndPersist()
     {
         SaveCurrent();
-        var account = AccountConfig.CreateDefault();
-        account.Email = $"account{_accounts.Count + 1}@test.com";
-        _accounts.Add(account);
-        ActiveAccountId = account.Id;
-        ActiveShopId = account.Shops[0].Id;
-        RefreshLists();
-    }
-
-    private void RemoveAccount()
-    {
-        if (CurrentAccount is not { } account || _accounts.Count <= 1)
-            return;
-        _accounts.Remove(account);
-        ActiveAccountId = _accounts[0].Id;
-        ActiveShopId = _accounts[0].Shops[0].Id;
-        RefreshLists();
+        LauncherSettings.Save(_settings);
     }
 
     private void AddShop()
     {
         SaveCurrent();
-        if (CurrentAccount is not { } account)
-            return;
+        var account = ActiveAccount;
+        if (account is null) return;
         var shop = ShopConfig.CreateDefault();
         shop.Name = $"Shop {account.Shops.Count + 1}";
         account.Shops.Add(shop);
-        ActiveShopId = shop.Id;
-        RefreshLists();
+        _settings.ActiveShopId = shop.Id;
+        LauncherSettings.Save(_settings);
+        RefreshShopList();
     }
 
     private void RemoveShop()
     {
-        if (CurrentAccount is not { } account || CurrentShop is not { } shop || account.Shops.Count <= 1)
-            return;
+        var account = ActiveAccount;
+        if (account is null || CurrentShop is not { } shop || account.Shops.Count <= 1) return;
         account.Shops.Remove(shop);
-        ActiveShopId = account.Shops[0].Id;
-        RefreshLists();
+        _settings.ActiveShopId = account.Shops[0].Id;
+        LauncherSettings.Save(_settings);
+        RefreshShopList();
     }
 
     private void BrowseWorkbook()
@@ -401,7 +310,7 @@ internal sealed class AccountShopManagerForm : Form
             Filter = "Excel files (*.xlsx;*.xlsm)|*.xlsx;*.xlsm|All files (*.*)|*.*",
             Title = "Chọn workbook",
         };
-        if (ofd.ShowDialog(this) != DialogResult.OK) return;
+        if (ofd.ShowDialog(FindForm()) != DialogResult.OK) return;
         _workbookTextBox.Text = ofd.FileName;
         RefreshSheetDropdown(ofd.FileName);
     }
@@ -415,23 +324,21 @@ internal sealed class AccountShopManagerForm : Form
             FileName = "bigseller-cookies.json",
             InitialDirectory = AppSession.ProjectSourceDirectory,
         };
-        if (sfd.ShowDialog(this) == DialogResult.OK)
+        if (sfd.ShowDialog(FindForm()) == DialogResult.OK)
             _bigSellerCookieFileTextBox.Text = sfd.FileName;
     }
 
-    private async void OpenBigSellerLoginForm()
+    private async void OpenBigSellerLogin()
     {
         SaveCurrent();
-        var account = CurrentAccount;
-        if (account is null)
-        {
-            MessageBox.Show("Vui lòng chọn account trước.", "BigSeller", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
+        var account = ActiveAccount;
+        if (account is null) return;
 
-        if (string.IsNullOrWhiteSpace(_braveExe) || !File.Exists(_braveExe))
+        var braveExe = _settings.BraveExe;
+        if (string.IsNullOrWhiteSpace(braveExe) || !File.Exists(braveExe))
         {
-            MessageBox.Show("Chưa cấu hình đường dẫn Brave.exe.", "BigSeller", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show("Chưa cấu hình đường dẫn Brave.exe trong Cài đặt chung.", "BigSeller",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -454,10 +361,8 @@ internal sealed class AccountShopManagerForm : Form
         try
         {
             AppendLoginLog($"File cookie sẽ lưu tại: {cookieFile}");
-
             _loginRunner = await BigSellerLoginRunner.LaunchAsync(
-                _braveExe, _sourceUserData, AppendLoginLog, _loginCts.Token).ConfigureAwait(true);
-
+                braveExe, _settings.SourceUserData, AppendLoginLog, _loginCts.Token).ConfigureAwait(true);
             AppendLoginLog("Đăng nhập trong cửa sổ Brave. Cookie tự lưu khi phát hiện đăng nhập thành công.");
 
             await _loginRunner.PollForLoginAndSaveCookiesAsync(
@@ -494,7 +399,6 @@ internal sealed class AccountShopManagerForm : Form
     private Panel CreateLoginLogPanel()
     {
         var panel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 4, 0, 0), Visible = false };
-
         var header = new FlowLayoutPanel
         {
             Dock = DockStyle.Top,
@@ -584,12 +488,6 @@ internal sealed class AccountShopManagerForm : Form
         _loginRunner = null;
         _loginCts?.Dispose();
         _loginCts = null;
-    }
-
-    private static List<AccountConfig> Clone(IReadOnlyList<AccountConfig> source)
-    {
-        var json = JsonSerializer.Serialize(source);
-        return JsonSerializer.Deserialize<List<AccountConfig>>(json) ?? [];
     }
 
     private sealed record SelectorItem(string Id, string Text)

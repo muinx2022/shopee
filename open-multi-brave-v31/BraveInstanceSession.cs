@@ -57,6 +57,15 @@ internal sealed class BraveInstanceSession : IDisposable
     private volatile bool _runnerResuming;
     private bool _extensionAutomationEnabled = true;
 
+    /// <summary>
+    /// File cookie BigSeller của account này — được lưu từ phiên đăng nhập không proxy (IP máy thật).
+    /// Khi instance chạy, cookies này sẽ được inject vào browser qua CDP (kết nối local, không qua proxy).
+    /// </summary>
+    private string _bigSellerCookieFile = "";
+
+    public void SetBigSellerCookieFile(string? cookieFile) =>
+        _bigSellerCookieFile = cookieFile?.Trim() ?? "";
+
     public event Action? StatusChanged;
     public event Action<string>? LogLine;
     public event Action? ExtensionProgressSynced;
@@ -357,6 +366,9 @@ internal sealed class BraveInstanceSession : IDisposable
                 if (!await EnsureShopeeLoggedInAsync(loopToken).ConfigureAwait(false))
                     throw new InvalidOperationException(
                         "Không đăng nhập được Shopee (captcha/OTP hoặc sai tài khoản) — bỏ qua instance này.");
+
+                // Import BigSeller cookie (nếu account có cấu hình) — qua CDP local, KHÔNG qua proxy instance.
+                await ImportBigSellerCookiesIfConfiguredAsync(loopToken).ConfigureAwait(false);
 
                 _runnerLoopActive = true;
                 Log("Bắt đầu chạy (launcher điều khiển)…");
@@ -1707,6 +1719,30 @@ internal sealed class BraveInstanceSession : IDisposable
             cookiesArray,
             new CookieImportFilter(includeShopee),
             Log);
+
+    /// <summary>
+    /// Import BigSeller cookie từ file account vào browser qua CDP.
+    /// CDP là kết nối WebSocket local — KHÔNG đi qua proxy của instance.
+    /// </summary>
+    private async Task ImportBigSellerCookiesIfConfiguredAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_bigSellerCookieFile) || !_running)
+            return;
+
+        try
+        {
+            await BigSellerCookieImporter.ImportFromFileAsync(
+                _cdpPort, _bigSellerCookieFile, Log, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log($"BigSeller cookie: {ex.Message}");
+        }
+    }
 
     private void SetStatus(string text)
     {

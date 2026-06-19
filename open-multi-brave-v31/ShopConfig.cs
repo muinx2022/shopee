@@ -5,6 +5,8 @@ public sealed class AccountConfig
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string Email { get; set; } = "";
     public string WorkbookPath { get; set; } = "";
+    /// <summary>Đường dẫn file JSON cookie BigSeller — được đăng nhập qua IP máy thật (không proxy).</summary>
+    public string BigSellerCookieFile { get; set; } = "";
     public List<ShopConfig> Shops { get; set; } = [];
 
     public string DisplayName =>

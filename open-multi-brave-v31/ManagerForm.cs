@@ -10,6 +10,7 @@ internal sealed class ManagerForm : Form
     private readonly ListView _accountList;
     private readonly TabControl _workspaceTabs;
     private readonly ImageList _accountStatusImages;
+    private bool _syncingSelection;
 
     public ManagerForm()
     {
@@ -41,7 +42,7 @@ internal sealed class ManagerForm : Form
         _accountList.Columns.Add("Account", 160);
         _accountList.Columns.Add("Shop", 92);
         _accountList.Columns.Add("TT", 64);
-        _accountList.DoubleClick += (_, _) => OpenSelectedAccount();
+        _accountList.DoubleClick += (_, _) => OpenSelectedAccount(goToSettings: true);
 
         _workspaceTabs = new TabControl
         {
@@ -51,6 +52,27 @@ internal sealed class ManagerForm : Form
         };
         _workspaceTabs.DrawItem += DrawWorkspaceTab;
         _workspaceTabs.MouseDown += OnWorkspaceTabMouseDown;
+        _workspaceTabs.SelectedIndexChanged += (_, _) =>
+        {
+            if (_syncingSelection) return;
+            if (_workspaceTabs.SelectedTab?.Tag is string accountId)
+            {
+                _syncingSelection = true;
+                try { SelectAccountInList(accountId); }
+                finally { _syncingSelection = false; }
+            }
+        };
+        _accountList.SelectedIndexChanged += (_, _) =>
+        {
+            UpdateAccountIcons();
+            if (_syncingSelection) return;
+            if (SelectedAccountId is { } accountId && _openWorkspaces.TryGetValue(accountId, out var page))
+            {
+                _syncingSelection = true;
+                try { _workspaceTabs.SelectedTab = page; }
+                finally { _syncingSelection = false; }
+            }
+        };
 
         _split.Panel1.Controls.Add(CreateNavPanel());
         _split.Panel2.Controls.Add(_workspaceTabs);
@@ -99,46 +121,100 @@ internal sealed class ManagerForm : Form
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            RowCount = 3,
+            RowCount = 4,
             ColumnCount = 1,
             Padding = new Padding(8),
         };
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         var title = new Label
         {
-            Text = "Account / shop",
+            Text = "Account",
             Dock = DockStyle.Fill,
             Font = new Font(Font, FontStyle.Bold),
             AutoSize = true,
-            Margin = new Padding(0, 0, 0, 8),
+            Margin = new Padding(0, 0, 0, 4),
         };
         root.Controls.Add(title, 0, 0);
+
+        // Right-click selects item before menu opens
+        _accountList.MouseDown += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Right) return;
+            var hit = _accountList.GetItemAt(e.X, e.Y);
+            if (hit is not null) { hit.Selected = true; hit.Focused = true; }
+        };
+        _accountList.ContextMenuStrip = BuildAccountContextMenu();
         root.Controls.Add(_accountList, 0, 1);
 
+        // [+] [−] compact toolbar
+        var listBar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(0, 3, 0, 4),
+        };
+        var btnAdd = CreateIconButton("+  Thêm Acc", "Thêm account", Color.FromArgb(46, 160, 67), Color.FromArgb(232, 245, 233));
+        btnAdd.Click += (_, _) => AddAccount();
+        var btnRemove = CreateIconButton("−  Xóa Acc", "Xóa account", Color.FromArgb(200, 70, 60), Color.FromArgb(250, 235, 233));
+        btnRemove.Click += (_, _) => RemoveAccount();
+        listBar.Controls.Add(btnAdd);
+        listBar.Controls.Add(btnRemove);
+        root.Controls.Add(listBar, 0, 2);
+
+        // Action buttons
         var buttons = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
             AutoSize = true,
             WrapContents = true,
-            Padding = new Padding(0, 8, 0, 0),
+            Padding = new Padding(0, 4, 0, 0),
         };
-
         var runButton = CreateButton("Chạy", 90);
-        runButton.Click += (_, _) => OpenSelectedAccount();
-        var manageButton = CreateButton("Account / shop", 118);
-        manageButton.Click += (_, _) => ShowAccountShopManager();
+        runButton.Click += (_, _) => OpenSelectedAccount(goToSettings: false);
         var settingsButton = CreateButton("Cài đặt", 90);
         settingsButton.Click += (_, _) => ShowGlobalSettings();
         buttons.Controls.Add(runButton);
-        buttons.Controls.Add(manageButton);
         buttons.Controls.Add(settingsButton);
-        root.Controls.Add(buttons, 0, 2);
+        root.Controls.Add(buttons, 0, 3);
 
         return root;
+    }
+
+    private ContextMenuStrip BuildAccountContextMenu()
+    {
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("Mở workspace", null, (_, _) => OpenSelectedAccount(goToSettings: false));
+        menu.Items.Add("Cài đặt account", null, (_, _) => OpenSelectedAccount(goToSettings: true));
+        menu.Items.Add("Đổi tên...", null, (_, _) => RenameAccount());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Thêm account mới", null, (_, _) => AddAccount());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Xóa", null, (_, _) => RemoveAccount());
+        return menu;
+    }
+
+    private void RenameAccount()
+    {
+        var accountId = SelectedAccountId;
+        if (string.IsNullOrWhiteSpace(accountId)) return;
+        var account = _settings.Accounts.FirstOrDefault(a => a.Id == accountId);
+        if (account is null) return;
+
+        var newEmail = PromptText("Đổi tên account", "Email account:", account.Email);
+        if (newEmail is null) return;
+
+        account.Email = newEmail;
+        LauncherSettings.Save(_settings);
+        RefreshAccounts();
+
+        if (_openWorkspaces.TryGetValue(accountId, out var page))
+            page.Text = account.DisplayName;
     }
 
     private static Button CreateButton(string text, int width) => new()
@@ -149,8 +225,38 @@ internal sealed class ManagerForm : Form
         Margin = new Padding(0, 0, 6, 6),
     };
 
+    private readonly ToolTip _navToolTip = new();
+
+    private Button CreateIconButton(string text, string tooltip, Color accentColor, Color hoverColor)
+    {
+        var btn = new Button
+        {
+            Text = text,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Height = 28,
+            FlatStyle = FlatStyle.Flat,
+            ForeColor = accentColor,
+            BackColor = Color.FromArgb(248, 249, 250),
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleCenter,
+            Padding = new Padding(8, 2, 8, 2),
+            Margin = new Padding(0, 0, 5, 0),
+            Cursor = Cursors.Hand,
+            UseVisualStyleBackColor = false,
+            UseCompatibleTextRendering = false,
+        };
+        btn.FlatAppearance.BorderColor = Color.FromArgb(214, 217, 222);
+        btn.FlatAppearance.BorderSize = 1;
+        btn.FlatAppearance.MouseOverBackColor = hoverColor;
+        btn.FlatAppearance.MouseDownBackColor = hoverColor;
+        _navToolTip.SetToolTip(btn, tooltip);
+        return btn;
+    }
+
     private void RefreshAccounts()
     {
+        var previousSelectedId = SelectedAccountId;
         _accountList.Items.Clear();
         foreach (var account in _settings.Accounts)
         {
@@ -159,9 +265,11 @@ internal sealed class ManagerForm : Form
                 ?? "";
             var isOpen = _openWorkspaces.ContainsKey(account.Id);
             var isRunning = IsAccountRunning(account.Id);
+            var baseStatus = isRunning ? "running" : isOpen ? "open" : "idle";
             var item = new ListViewItem(account.DisplayName)
             {
-                ImageKey = isRunning ? "running" : isOpen ? "open" : "idle",
+                Name = baseStatus,                 // lưu status gốc để ghép với mũi tên
+                ImageKey = $"no_{baseStatus}",
             };
             item.SubItems.Add(shopName);
             item.SubItems.Add(isRunning ? "Chạy" : isOpen ? "Mở" : "");
@@ -169,8 +277,43 @@ internal sealed class ManagerForm : Form
             _accountList.Items.Add(item);
         }
 
-        if (_accountList.Items.Count > 0 && _accountList.SelectedItems.Count == 0)
-            _accountList.Items[0].Selected = true;
+        // Ưu tiên giữ selection theo tab workspace đang mở, rồi tới account đang chọn trước đó.
+        var targetId = (_workspaceTabs.SelectedTab?.Tag as string) ?? previousSelectedId;
+        if (string.IsNullOrWhiteSpace(targetId) || !SelectAccountInList(targetId))
+        {
+            if (_accountList.Items.Count > 0 && _accountList.SelectedItems.Count == 0)
+                _accountList.Items[0].Selected = true;
+        }
+
+        UpdateAccountIcons();
+    }
+
+    private void UpdateAccountIcons()
+    {
+        foreach (ListViewItem item in _accountList.Items)
+        {
+            var baseStatus = string.IsNullOrEmpty(item.Name) ? "idle" : item.Name;
+            item.ImageKey = $"{(item.Selected ? "sel" : "no")}_{baseStatus}";
+        }
+    }
+
+    private bool SelectAccountInList(string accountId)
+    {
+        foreach (ListViewItem item in _accountList.Items)
+        {
+            if (item.Tag as string == accountId)
+            {
+                if (!item.Selected)
+                {
+                    _accountList.SelectedItems.Clear();
+                    item.Selected = true;
+                }
+                item.Focused = true;
+                item.EnsureVisible();
+                return true;
+            }
+        }
+        return false;
     }
 
     private string? SelectedAccountId =>
@@ -178,37 +321,42 @@ internal sealed class ManagerForm : Form
             ? null
             : _accountList.SelectedItems[0].Tag as string;
 
-    private void OpenSelectedAccount()
+    private void OpenSelectedAccount(bool goToSettings = false)
     {
         var accountId = SelectedAccountId;
         if (string.IsNullOrWhiteSpace(accountId))
             return;
 
+        AccountWorkspaceControl? workspace;
+
         if (_openWorkspaces.TryGetValue(accountId, out var existing))
         {
             _workspaceTabs.SelectedTab = existing;
-            return;
+            workspace = existing.Controls.OfType<AccountWorkspaceControl>().FirstOrDefault();
+        }
+        else
+        {
+            var account = _settings.Accounts.FirstOrDefault(a => a.Id == accountId);
+            if (account is null) return;
+
+            _settings.ActiveAccountId = account.Id;
+            var activeShop = account.Shops.FirstOrDefault(s => s.Id == _settings.ActiveShopId)
+                          ?? account.Shops.FirstOrDefault();
+            if (activeShop is not null)
+                _settings.ActiveShopId = activeShop.Id;
+
+            workspace = new AccountWorkspaceControl(_settings, account.Id);
+            workspace.RunningStateChanged += () => SafeBeginInvoke(RefreshAccounts);
+            var page = new TabPage(account.DisplayName) { Tag = account.Id };
+            page.Controls.Add(workspace);
+            _workspaceTabs.TabPages.Add(page);
+            _workspaceTabs.SelectedTab = page;
+            _openWorkspaces[account.Id] = page;
+            RefreshAccounts();
         }
 
-        var account = _settings.Accounts.FirstOrDefault(a => a.Id == accountId);
-        if (account is null)
-            return;
-
-        _settings.ActiveAccountId = account.Id;
-        if (!account.Shops.Any(s => s.Id == _settings.ActiveShopId))
-            _settings.ActiveShopId = account.Shops.First().Id;
-
-        var workspace = new AccountWorkspaceControl(_settings, account.Id);
-        workspace.RunningStateChanged += () => SafeBeginInvoke(RefreshAccounts);
-        var page = new TabPage(account.DisplayName)
-        {
-            Tag = account.Id,
-        };
-        page.Controls.Add(workspace);
-        _workspaceTabs.TabPages.Add(page);
-        _workspaceTabs.SelectedTab = page;
-        _openWorkspaces[account.Id] = page;
-        RefreshAccounts();
+        if (goToSettings)
+            workspace?.SelectSettingsTab();
     }
 
     private async Task CloseWorkspaceAsync(TabPage page)
@@ -216,13 +364,44 @@ internal sealed class ManagerForm : Form
         if (page.Tag is not string accountId)
             return;
 
-        if (page.Controls.OfType<AccountWorkspaceControl>().FirstOrDefault() is { } workspace)
-            await workspace.ShutdownAsync().ConfigureAwait(true);
+        var workspace = page.Controls.OfType<AccountWorkspaceControl>().FirstOrDefault();
+        var running = workspace?.HasRunningWork == true;
+        var message = running
+            ? $"\"{page.Text}\" đang chạy. Đóng tab sẽ dừng tiến trình. Tiếp tục?"
+            : $"Đóng tab \"{page.Text}\"?";
+        var confirm = MessageBox.Show(
+            this, message, "Đóng tab",
+            MessageBoxButtons.YesNo,
+            running ? MessageBoxIcon.Warning : MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button2);
+        if (confirm != DialogResult.Yes)
+            return;
 
-        _openWorkspaces.Remove(accountId);
-        _workspaceTabs.TabPages.Remove(page);
-        page.Dispose();
-        RefreshAccounts();
+        var busy = new BusyDialog("Đang đóng profile, vui lòng chờ…");
+        busy.Show(this);
+        Enabled = false;
+        // Giữ hộp thoại hiện ít nhất ~1.5s để không bị nháy khi đóng nhanh.
+        var minDisplay = Task.Delay(1500);
+        try
+        {
+            if (workspace is not null)
+                await workspace.ShutdownAsync().ConfigureAwait(true);
+
+            _openWorkspaces.Remove(accountId);
+            _workspaceTabs.TabPages.Remove(page);
+            page.Dispose();
+            RefreshAccounts();
+
+            await minDisplay.ConfigureAwait(true);
+        }
+        finally
+        {
+            // Chỉ đóng dialog sau khi profile + tab đã đóng xong.
+            Enabled = true;
+            busy.Close();
+            busy.Dispose();
+            Activate();
+        }
     }
 
     private bool IsAccountRunning(string accountId)
@@ -249,27 +428,50 @@ internal sealed class ManagerForm : Form
         var images = new ImageList
         {
             ColorDepth = ColorDepth.Depth32Bit,
-            ImageSize = new Size(14, 14),
+            ImageSize = new Size(28, 16),
         };
-        images.Images.Add("idle", CreateStatusDot(Color.Transparent, Color.Transparent));
-        images.Images.Add("open", CreateStatusDot(Color.FromArgb(175, 180, 188), Color.FromArgb(145, 150, 158)));
-        images.Images.Add("running", CreateStatusDot(Color.FromArgb(38, 185, 92), Color.FromArgb(22, 128, 64)));
+        // 6 biến thể: {active}_{status}. active = acc đang chọn (có mũi tên ►).
+        var statuses = new (string Key, Color Fill, Color Border)[]
+        {
+            ("idle", Color.Transparent, Color.Transparent),
+            ("open", Color.FromArgb(175, 180, 188), Color.FromArgb(145, 150, 158)),
+            ("running", Color.FromArgb(46, 204, 113), Color.FromArgb(30, 150, 80)),
+        };
+        foreach (var s in statuses)
+        {
+            images.Images.Add($"no_{s.Key}", CreateStatusIcon(false, s.Fill, s.Border));
+            images.Images.Add($"sel_{s.Key}", CreateStatusIcon(true, s.Fill, s.Border));
+        }
         return images;
     }
 
-    private static Bitmap CreateStatusDot(Color fill, Color border)
+    private static Bitmap CreateStatusIcon(bool active, Color fill, Color border)
     {
-        var bitmap = new Bitmap(14, 14);
+        var bitmap = new Bitmap(28, 16);
         using var graphics = Graphics.FromImage(bitmap);
         graphics.Clear(Color.Transparent);
-        if (fill.A == 0)
-            return bitmap;
-
         graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-        using var brush = new SolidBrush(fill);
-        using var pen = new Pen(border);
-        graphics.FillEllipse(brush, 3, 3, 8, 8);
-        graphics.DrawEllipse(pen, 3, 3, 8, 8);
+
+        // Mũi tên ► bên trái cho acc đang active
+        if (active)
+        {
+            using var arrowBrush = new SolidBrush(Color.FromArgb(60, 120, 215));
+            graphics.FillPolygon(arrowBrush, new[]
+            {
+                new Point(1, 3),
+                new Point(9, 8),
+                new Point(1, 13),
+            });
+        }
+
+        // Chấm trạng thái bên phải
+        if (fill.A != 0)
+        {
+            using var brush = new SolidBrush(fill);
+            using var pen = new Pen(border);
+            graphics.FillEllipse(brush, 15, 3, 10, 10);
+            graphics.DrawEllipse(pen, 15, 3, 10, 10);
+        }
         return bitmap;
     }
 
@@ -331,6 +533,116 @@ internal sealed class ManagerForm : Form
         _settings.Accounts = Clone(form.Accounts).ToList();
         _settings.ActiveAccountId = form.ActiveAccountId;
         _settings.ActiveShopId = form.ActiveShopId;
+        LauncherSettings.Save(_settings);
+        RefreshAccounts();
+    }
+
+    private void AddAccount()
+    {
+        var email = PromptText("Thêm account", "Email account:", $"account{_settings.Accounts.Count + 1}@email.com");
+        if (email is null) return;
+
+        var account = new AccountConfig { Email = email };
+        _settings.Accounts.Add(account);
+        _settings.ActiveAccountId = account.Id;
+        _settings.ActiveShopId = "";
+        LauncherSettings.Save(_settings);
+        RefreshAccounts();
+
+        // Chọn account vừa tạo và mở thẳng tab Cài đặt
+        foreach (ListViewItem item in _accountList.Items)
+        {
+            if (item.Tag as string == account.Id)
+            {
+                item.Selected = true;
+                item.Focused = true;
+                break;
+            }
+        }
+        OpenSelectedAccount(goToSettings: true);
+    }
+
+    private string? PromptText(string title, string label, string defaultValue = "")
+    {
+        using var dlg = new Form
+        {
+            Text = title,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ClientSize = new Size(340, 118),
+        };
+
+        var lbl = new Label
+        {
+            Text = label,
+            AutoSize = true,
+            Location = new Point(12, 14),
+        };
+        var box = new TextBox
+        {
+            Text = defaultValue,
+            Location = new Point(12, 36),
+            Width = 316,
+            Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top,
+        };
+        var ok = new Button
+        {
+            Text = "OK",
+            DialogResult = DialogResult.OK,
+            Width = 80,
+            Height = 28,
+            Location = new Point(248, 76),
+            Anchor = AnchorStyles.Right | AnchorStyles.Bottom,
+        };
+        var cancel = new Button
+        {
+            Text = "Hủy",
+            DialogResult = DialogResult.Cancel,
+            Width = 80,
+            Height = 28,
+            Location = new Point(160, 76),
+            Anchor = AnchorStyles.Right | AnchorStyles.Bottom,
+        };
+
+        dlg.Controls.AddRange([lbl, box, ok, cancel]);
+        dlg.AcceptButton = ok;
+        dlg.CancelButton = cancel;
+        dlg.ActiveControl = box;
+        box.SelectAll();
+
+        if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+        var result = box.Text.Trim();
+        return string.IsNullOrWhiteSpace(result) ? null : result;
+    }
+
+    private void RemoveAccount()
+    {
+        var accountId = SelectedAccountId;
+        if (string.IsNullOrWhiteSpace(accountId)) return;
+        if (_settings.Accounts.Count <= 1)
+        {
+            MessageBox.Show("Phải có ít nhất 1 account.", "Xóa account", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var account = _settings.Accounts.FirstOrDefault(a => a.Id == accountId);
+        if (account is null) return;
+
+        var confirm = MessageBox.Show(
+            $"Xóa account \"{account.DisplayName}\"?",
+            "Xóa account",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning);
+        if (confirm != DialogResult.Yes) return;
+
+        if (_openWorkspaces.TryGetValue(accountId, out var page))
+            _ = CloseWorkspaceAsync(page);
+
+        _settings.Accounts.Remove(account);
+        _settings.ActiveAccountId = _settings.Accounts[0].Id;
+        _settings.ActiveShopId = _settings.Accounts[0].Shops[0].Id;
         LauncherSettings.Save(_settings);
         RefreshAccounts();
     }
@@ -409,7 +721,7 @@ internal sealed class ManagerForm : Form
         foreach (var page in _workspaceTabs.TabPages.Cast<TabPage>().ToList())
         {
             if (page.Controls.OfType<AccountWorkspaceControl>().FirstOrDefault() is { } workspace)
-                workspace.ShutdownAsync().GetAwaiter().GetResult();
+                workspace.Shutdown();
         }
     }
 

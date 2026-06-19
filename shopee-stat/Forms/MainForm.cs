@@ -119,6 +119,7 @@ public sealed class MainForm : Form
     private readonly Button _markErrorBtn;
     private readonly Button _recoverBtn;
     private readonly Button _solveCaptchaBtn;
+    private readonly Button _exportAccountBtn;
 
     // Tab 3 - Keywords
     private readonly DataGridView _keywordsGrid;
@@ -193,7 +194,7 @@ public sealed class MainForm : Form
         tabs.TabPages.Add(tabFile);
 
         // Tab 2: Tài khoản
-        (_accountInnerTabs, _accountsGrid, _errorAccountsGrid, _importBtn, _addAccountBtn, _editAccountBtn, _deleteAccountBtn, _markErrorBtn, _recoverBtn, _solveCaptchaBtn) =
+        (_accountInnerTabs, _accountsGrid, _errorAccountsGrid, _importBtn, _addAccountBtn, _editAccountBtn, _deleteAccountBtn, _markErrorBtn, _recoverBtn, _solveCaptchaBtn, _exportAccountBtn) =
             BuildAccountsTab(out var tab2);
         tabs.TabPages.Add(tab2);
 
@@ -553,7 +554,7 @@ public sealed class MainForm : Form
         return grid;
     }
 
-    private static (TabControl innerTabs, DataGridView grid, DataGridView errorGrid, Button importBtn, Button addBtn, Button editBtn, Button deleteBtn, Button markErrorBtn, Button recoverBtn, Button solveCaptchaBtn)
+    private static (TabControl innerTabs, DataGridView grid, DataGridView errorGrid, Button importBtn, Button addBtn, Button editBtn, Button deleteBtn, Button markErrorBtn, Button recoverBtn, Button solveCaptchaBtn, Button exportAccountBtn)
         BuildAccountsTab(out TabPage page)
     {
         page = new TabPage("Tài khoản");
@@ -576,6 +577,7 @@ public sealed class MainForm : Form
         var markErrorBtn = new Button { Text = "Đánh dấu lỗi →", Width = 120, Height = 28, ForeColor = Color.FromArgb(180, 40, 40) };
         var solveCaptchaBtn = new Button { Text = "Mở giải captcha", Width = 130, Height = 28, ForeColor = Color.FromArgb(0, 90, 160) };
         var recoverBtn = new Button { Text = "← Khôi phục", Width = 110, Height = 28, ForeColor = Color.FromArgb(0, 120, 60) };
+        var exportAccountBtn = new Button { Text = "Export account", Width = 120, Height = 28, ForeColor = Color.FromArgb(0, 100, 50) };
         btnRow.Controls.Add(importBtn);
         btnRow.Controls.Add(addBtn);
         btnRow.Controls.Add(editBtn);
@@ -583,6 +585,7 @@ public sealed class MainForm : Form
         btnRow.Controls.Add(markErrorBtn);
         btnRow.Controls.Add(solveCaptchaBtn);
         btnRow.Controls.Add(recoverBtn);
+        btnRow.Controls.Add(exportAccountBtn);
         panel.Controls.Add(btnRow, 0, 0);
 
         static DataGridView NewGrid()
@@ -617,7 +620,7 @@ public sealed class MainForm : Form
         innerTabs.TabPages.Add(errorPage);
         panel.Controls.Add(innerTabs, 0, 1);
 
-        return (innerTabs, grid, errorGrid, importBtn, addBtn, editBtn, deleteBtn, markErrorBtn, recoverBtn, solveCaptchaBtn);
+        return (innerTabs, grid, errorGrid, importBtn, addBtn, editBtn, deleteBtn, markErrorBtn, recoverBtn, solveCaptchaBtn, exportAccountBtn);
     }
 
     private static (DataGridView grid, Button importBtn, Button addBtn, Button editBtn, Button deleteBtn, Button markUnusedBtn, Button selectAllBtn)
@@ -1169,6 +1172,7 @@ public sealed class MainForm : Form
         _recoverBtn.Click += OnRecoverAccountClick;
         _solveCaptchaBtn.Click += OnSolveCaptchaClick;
         _toolTip.SetToolTip(_solveCaptchaBtn, "Mở Edge với chính profile tài khoản lỗi để tự giải verify/captcha, xong bấm \"← Khôi phục\"");
+        _exportAccountBtn.Click += OnExportAccountClick;
         _accountsGrid.CellDoubleClick += (_, _) => OnEditAccountClick(null, EventArgs.Empty);
         _errorAccountsGrid.CellDoubleClick += (_, _) => OnEditAccountClick(null, EventArgs.Empty);
         _importKeywordBtn.Click += OnImportKeywordsClick;
@@ -3088,6 +3092,16 @@ public sealed class MainForm : Form
     }
 
     // "← Khôi phục": đưa account đang chọn (tab Lỗi) về lại tab Bình thường để dùng tiếp.
+    private void OnExportAccountClick(object? sender, EventArgs e)
+    {
+        var normalAccounts = _appSettings.Settings.Instances
+            .Where(a => !a.IsError)
+            .ToList();
+        using var form = new ExportAccountForm(normalAccounts);
+        if (form.ShowDialog(this) == DialogResult.OK)
+            SetStatus($"Đã export {normalAccounts.Count} tài khoản bình thường.");
+    }
+
     private void OnRecoverAccountClick(object? sender, EventArgs e)
     {
         var selected = SelectedAccounts(_errorAccountsGrid);

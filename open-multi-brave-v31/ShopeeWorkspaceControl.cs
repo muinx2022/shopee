@@ -70,7 +70,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             var account = _settings.Accounts.First(a => a.Id == _workspaceAccountId);
             _activeShopId = account.Shops.Any(s => s.Id == _settings.ActiveShopId)
                 ? _settings.ActiveShopId
-                : account.Shops.First().Id;
+                : account.Shops.FirstOrDefault()?.Id ?? "";
         }
         else
         {
@@ -79,7 +79,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             _activeAccountId = account.Id;
             _activeShopId = account.Shops.Any(s => s.Id == _settings.ActiveShopId)
                 ? _settings.ActiveShopId
-                : account.Shops.First().Id;
+                : account.Shops.FirstOrDefault()?.Id ?? "";
         }
 
         Dock = DockStyle.Fill;
@@ -189,10 +189,37 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         Resize += (_, _) => ApplySplitLayout();
     }
 
-    public Task ShutdownAsync()
+    /// <summary>Đóng đồng bộ (thoát app): kill profile ngay trên UI thread, không spinner.</summary>
+    public void Shutdown() => ShutdownCore();
+
+    public async Task ShutdownAsync()
     {
-        ShutdownCore();
-        return Task.CompletedTask;
+        if (_shutdownStarted)
+            return;
+
+        _shutdownStarted = true;
+        _allProgressTimer.Stop();
+        _allProgressTimer.Dispose();
+        _batchScheduler.Stop();
+        _detailPanel.FlushToConfig();
+
+        // Đóng từng profile: StopAsync chạy phần kill nặng ở background (Task.Run bên trong),
+        // nên UI thread rảnh → spinner trong BusyDialog quay được. Chạy đồng thời mọi instance.
+        var sessions = _entries.Select(e => e.Session).ToList();
+        try
+        {
+            await Task.WhenAll(sessions.Select(s => s.StopAsync())).ConfigureAwait(true);
+        }
+        catch { }
+
+        // Dispose mọi session (UI thread): giải phóng timer + CTS, kill nốt profile còn sót.
+        foreach (var entry in _entries)
+        {
+            try { entry.Session.Dispose(); } catch { }
+            _portAllocator.Release(entry.CdpPort);
+        }
+        PersistSettings();
+        NotifyRunningStateChanged();
     }
 
     public bool HasRunningWork =>
@@ -219,8 +246,14 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         _batchScheduler.Stop();
         _detailPanel.FlushToConfig();
         StopAllForShutdown();
+        // Dispose MỌI session (không chỉ session đang chạy): vừa kill tận gốc Brave còn sót
+        // (lưới chặn cuối qua KillBraveProcess), vừa giải phóng timer + CTS để tránh rò rỉ tích luỹ
+        // qua mỗi lần mở/đóng tab. _entries chỉ chứa instance của account này nên an toàn.
         foreach (var entry in _entries)
+        {
+            try { entry.Session.Dispose(); } catch { }
             _portAllocator.Release(entry.CdpPort);
+        }
         PersistSettings();
         NotifyRunningStateChanged();
     }
@@ -351,7 +384,11 @@ internal sealed class ShopeeWorkspaceControl : UserControl
 
     private ShopConfig ActiveShop =>
         ActiveAccount.Shops.FirstOrDefault(s => s.Id == _activeShopId)
-        ?? ActiveAccount.Shops.First();
+        ?? ActiveAccount.Shops.FirstOrDefault()
+        ?? (_fallbackShop ??= new ShopConfig());
+
+    /// <summary>Shop rỗng dùng tạm khi account chưa có shop nào — tránh crash, không lưu vào settings.</summary>
+    private ShopConfig? _fallbackShop;
 
     private bool IsWorkspaceInstance(InstanceConfig config) =>
         _workspaceAccountId is null ||
@@ -414,7 +451,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         ApiServerHelper.ConfigureWorkbookPath(account.WorkbookPath);
         if (!account.Shops.Any(s => s.Id == _activeShopId))
         {
-            _activeShopId = account.Shops[0].Id;
+            _activeShopId = account.Shops.FirstOrDefault()?.Id ?? "";
             if (_workspaceAccountId is null)
                 _settings.ActiveShopId = _activeShopId;
         }
@@ -521,6 +558,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             if (!string.IsNullOrWhiteSpace(shop.ShopeeDataSheet))
                 entry.Config.DataSheet = shop.ShopeeDataSheet.Trim();
             entry.Session.ApplyConfig(entry.Config);
+            entry.Session.SetBigSellerCookieFile(GetBigSellerCookieFile(entry.Config.AccountId));
             RefreshListItem(entry.Config.Id);
         }
     }
@@ -537,6 +575,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         if (!string.IsNullOrWhiteSpace(shop.ShopeeDataSheet))
             config.DataSheet = shop.ShopeeDataSheet.Trim();
         entry.Session.ApplyConfig(config);
+        entry.Session.SetBigSellerCookieFile(GetBigSellerCookieFile(config.AccountId));
     }
 
     private bool SyncWorkspaceDefaultsToEntries(bool syncSheet = true)
@@ -549,6 +588,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
 
             changed = true;
             entry.Session.ApplyConfig(entry.Config);
+            entry.Session.SetBigSellerCookieFile(GetBigSellerCookieFile(entry.Config.AccountId));
             RefreshListItem(entry.Config.Id);
         }
 
@@ -645,6 +685,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             AddInstanceCore(config, select: false);
             var entry = _entries.First(e => e.Config.Id == config.Id);
             entry.Session.ApplyConfig(config);
+            entry.Session.SetBigSellerCookieFile(GetBigSellerCookieFile(config.AccountId));
             if (proxyKeys is { Count: > 0 })
                 ShopeeImportService.ApplyProxyImport([entry], proxyKeys, RefreshListItem, startIndex: i);
             RefreshListItem(config.Id);
@@ -1164,6 +1205,9 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         PersistSettings();
     }
 
+    private string? GetBigSellerCookieFile(string accountId) =>
+        _settings.Accounts.FirstOrDefault(a => a.Id == accountId)?.BigSellerCookieFile;
+
     private void AddInstanceCore(InstanceConfig config, bool select)
     {
         config.EnsureProfileRelativePath();
@@ -1171,6 +1215,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         var cdpPort = _portAllocator.AllocateInstancePort();
         var session = new BraveInstanceSession(cdpPort, msg => AppendLog($"[{config.DisplayName}] {msg}"));
         session.ApplyConfig(config);
+        session.SetBigSellerCookieFile(GetBigSellerCookieFile(config.AccountId));
         session.LogLine += msg => SafeBeginInvoke(() => AppendInstanceLog(config, msg), "session.LogLine");
         session.StatusChanged += () => SafeBeginInvoke(() =>
         {
@@ -1746,6 +1791,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
                 try
                 {
                     entry.Session.ApplyConfig(entry.Config);
+                    entry.Session.SetBigSellerCookieFile(GetBigSellerCookieFile(entry.Config.AccountId));
                     await StopInstanceWorkAsync(entry).ConfigureAwait(true);
                     AppendLog($"[{entry.Config.DisplayName}] Đã dừng runner (lượt cũ).");
                 }
@@ -2088,6 +2134,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
             c.ProgressSyncedAt = null;
 
             entry.Session.ApplyConfig(c);
+            entry.Session.SetBigSellerCookieFile(GetBigSellerCookieFile(c.AccountId));
             RefreshListItem(c.Id);
 
             start = checked(end + 1);
@@ -2198,6 +2245,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         try
         {
             entry.Session.ApplyConfig(c);
+            entry.Session.SetBigSellerCookieFile(GetBigSellerCookieFile(c.AccountId));
             await StopInstanceWorkAsync(entry).ConfigureAwait(true);
             _detailPanel.RefreshProgressFromConfig();
             RefreshListItem(c.Id);
@@ -2410,6 +2458,7 @@ internal sealed class ShopeeWorkspaceControl : UserControl
         bool preferSuggestedResume)
     {
         entry.Session.ApplyConfig(entry.Config);
+        entry.Session.SetBigSellerCookieFile(GetBigSellerCookieFile(entry.Config.AccountId));
         await entry.Session.ResumeContinueAsync(
                 brave,
                 userData,

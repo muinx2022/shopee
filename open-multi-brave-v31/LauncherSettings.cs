@@ -155,8 +155,6 @@ internal static class LauncherSettings
             if (string.IsNullOrWhiteSpace(account.Id))
                 account.Id = Guid.NewGuid().ToString("N");
             account.Shops ??= [];
-            if (account.Shops.Count == 0)
-                account.Shops.Add(ShopConfig.CreateDefault());
 
             foreach (var shop in account.Shops)
             {
@@ -168,8 +166,9 @@ internal static class LauncherSettings
 
         var activeAccount = data.Accounts.FirstOrDefault(a => a.Id == data.ActiveAccountId) ?? data.Accounts[0];
         data.ActiveAccountId = activeAccount.Id;
-        var activeShop = activeAccount.Shops.FirstOrDefault(s => s.Id == data.ActiveShopId) ?? activeAccount.Shops[0];
-        data.ActiveShopId = activeShop.Id;
+        var activeShop = activeAccount.Shops.FirstOrDefault(s => s.Id == data.ActiveShopId)
+                      ?? activeAccount.Shops.FirstOrDefault();
+        data.ActiveShopId = activeShop?.Id ?? "";
     }
 
     private static void EnsureInstanceShop(LauncherSettingsFile data, InstanceConfig inst)
@@ -181,8 +180,8 @@ internal static class LauncherSettings
 
         var shop = account.Shops.FirstOrDefault(s => s.Id == inst.ShopId)
             ?? account.Shops.FirstOrDefault(s => s.Id == data.ActiveShopId)
-            ?? account.Shops.First();
-        inst.ShopId = shop.Id;
+            ?? account.Shops.FirstOrDefault();
+        inst.ShopId = shop?.Id ?? "";
     }
 
     private static void NormalizeRangeSettings(LauncherSettingsFile data)
